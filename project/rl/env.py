@@ -172,6 +172,10 @@ class RLEnv:
         # ====================================================
         # 1. 立即更新 Mask (Action First)
         # ====================================================
+        # [关键步骤 1] 备份旧 Mask (Pre-Stop Mask)
+        # clone() 很重要，防止后续原地修改影响这里
+        pre_subtask_active_mask = self.subtask_active_mask.clone()
+
         # 如果 Agent 决定停止，对应的 Mask 立即变为 False
         # 这意味着：本层的 Query 修正无效，本层的 Transformer 结果无效
         should_stop = (stop_decision == 1)
@@ -254,8 +258,13 @@ class RLEnv:
         info = {
             'step': self.current_step,
             'active_mask': self.subtask_active_mask,
-            'labels': self.current_labels
+            'pre_action_mask': pre_subtask_active_mask,  # [新增] 这是给 Reward 计算用的旧 mask
+            'labels': self.current_labels,
+            # [新增] 显式传出分类头使用的输入
+            'cls_input_q': torch.cat([self.q_t1, self.q_t2], dim=-1)
         }
+
+        #返回占位符 rewards 以符合标准接口
         rewards = torch.zeros(self.batch_size, device=self.device)
 
         return self._get_observation(), rewards, dones, info
@@ -271,14 +280,12 @@ class RLEnv:
         # 3. Entropy: [B, Total_Subtasks]
         # 基于当前的 final_logits 计算
         # 如果 logits 全为 0 (前几层)，entropy 也是均匀分布的高熵
-        if self.final_logits is not None:
-            # Binary Cross Entropy 场景 (Sigmoid)
-            probs = torch.sigmoid(self.final_logits)
-            # H(p) = -p log p - (1-p) log (1-p)
-            entropy = -(probs * torch.log(probs + 1e-6) + (1 - probs) * torch.log(1 - probs + 1e-6))
-            # 如果是多分类，逻辑需调整为 softmax
-        else:
-            entropy = torch.zeros((self.batch_size, self.total_subtasks), device=self.device)
+        # Binary Cross Entropy 场景 (Sigmoid)
+        # reset 时 final_logits 已初始化为 0，Sigmoid(0)=0.5，逻辑是自洽的
+        probs = torch.sigmoid(self.final_logits)
+        # H(p) = -p log p - (1-p) log (1-p)
+        entropy = -(probs * torch.log(probs + 1e-6) + (1 - probs) * torch.log(1 - probs + 1e-6))
+        # 如果是多分类，逻辑需调整为 softmax
 
         # 4. Time: [B, 1]
         time_enc = torch.full((self.batch_size, 1), self.current_step / self.max_steps, device=self.device)
@@ -286,7 +293,8 @@ class RLEnv:
         return {
             'query_state': query_state,  # [B, N, 2D]
             'vision_context': vis_summary,  # [B, D]
-            'entropy': entropy,  # [B, Total_Subtasks]
+            'entropy': entropy,       # [B, Total_tasks] 明确的不确定性信号
+            'probs': probs,           # [B, Total_tasks] [新增] 明确的方向性信号
             'time': time_enc,  # [B, 1]
             'active_mask': self.subtask_active_mask  # [B, Total_Subtasks]
         }
