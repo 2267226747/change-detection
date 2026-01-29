@@ -4,7 +4,7 @@ import numpy as np
 
 
 class RLEnv:
-    def __init__(self, pretrained_model, config, device, freeze_classifier=True):
+    def __init__(self, pretrained_model, config, device, logger):
         """
         Args:
             pretrained_model: AssembledFusionModel 实例
@@ -15,7 +15,7 @@ class RLEnv:
         self.model = pretrained_model
         self.config = config
         self.device = device
-        self.freeze_classifier = freeze_classifier
+        self.freeze_classifier = self.config.freeze_classifier
 
         # ====================================================
         # 1. 冻结策略管理
@@ -216,8 +216,9 @@ class RLEnv:
         # 获取具体的 Block 实例
         block_sensing = self.model.transformer_blocks[sensing_idx]
         block_reasoning = self.model.transformer_blocks[reasoning_idx]
+        current_head = self.model.class_heads[self.current_step]
 
-        with torch.set_grad_enabled(not self.freeze_classifier):
+        with torch.no_grad():
             # Sensing Layer
             q_t1_next, q_t2_next = block_sensing(
                 q_t1=self.q_t1, q_t2=self.q_t2,
@@ -229,18 +230,13 @@ class RLEnv:
                 q_t1=q_t1_next, q_t2=q_t2_next
             )
 
-        # 模拟 Early Exit：只更新 active 的部分，token级别，但是在一个group内是一致的
-        self.q_t1 = q_t1_next
-        self.q_t2 = q_t2_next
-
-        # 4. 执行分类头 (MultitaskClassifier)
-        current_head = self.model.class_heads[self.current_step]
-
-        with torch.set_grad_enabled(not self.freeze_classifier):
+            # 模拟 Early Exit：只更新 active 的部分，token级别，但是在一个group内是一致的
+            # 4. 执行分类头 (MultitaskClassifier)
             # Forward
-            logits_dict = current_head(self.q_t1, self.q_t2)
-            # Flatten
-            current_logits_flat = self._flatten_logits(logits_dict)
+            logits_dict = current_head(q_t1_next, q_t2_next)
+
+        # Flatten
+        current_logits_flat = self._flatten_logits(logits_dict)
 
         # 更新结果 (Result Locking)
         self.final_logits = torch.where(
@@ -248,6 +244,10 @@ class RLEnv:
             current_logits_flat,
             self.final_logits
         )
+
+        # 更新query token
+        self.q_t1 = q_t1_next
+        self.q_t2 = q_t2_next
 
         self.current_step += 1
         # 检查是否所有任务都停止
@@ -264,7 +264,7 @@ class RLEnv:
             'cls_input_q': torch.cat([self.q_t1, self.q_t2], dim=-1)
         }
 
-        #返回占位符 rewards 以符合标准接口
+        # 返回占位符 rewards 以符合标准接口
         rewards = torch.zeros(self.batch_size, device=self.device)
 
         return self._get_observation(), rewards, dones, info
@@ -293,8 +293,8 @@ class RLEnv:
         return {
             'query_state': query_state,  # [B, N, 2D]
             'vision_context': vis_summary,  # [B, D]
-            'entropy': entropy,       # [B, Total_tasks] 明确的不确定性信号
-            'probs': probs,           # [B, Total_tasks] [新增] 明确的方向性信号
+            'entropy': entropy,  # [B, Total_tasks] 明确的不确定性信号
+            'probs': probs,  # [B, Total_tasks] [新增] 明确的方向性信号
             'time': time_enc,  # [B, 1]
             'active_mask': self.subtask_active_mask  # [B, Total_Subtasks]
         }

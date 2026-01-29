@@ -292,3 +292,85 @@ class MultiTaskLoss(nn.Module):
             df.insert(0, 'Epoch', epoch)
 
         return df
+
+
+class RLLoss(MultiTaskLoss):
+    def __init__(self, cfg):
+        """
+        RL 专用的 Loss 计算器。
+        继承自 MultiTaskLoss 以复用配置解析和 Loss 准则构建逻辑。
+        """
+        super().__init__(cfg)
+
+        # 预先计算每个 Group 在展平 Logits 中的切片索引
+        # 假设 Logits 是按照 self.tasks 中定义的顺序拼接的
+        # self.tasks 的结构: {'road': {'start': 0, 'end': 8}, ...}
+        # 这个结构在父类 __init__ 中已经构建好了，直接用即可。
+        pass
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits:
+                - 情况A (展平): [Batch, Total_Subtasks] Tensor
+                - 情况B (字典): {'road': [B, 8], 'building': [B, 4], ...}
+            targets: [Batch, Total_Subtasks] 始终假设标签是展平的 Tensor (来自 Buffer)
+
+        Returns:
+            loss_matrix: [Batch, Total_Subtasks] 每个样本每个子任务的 Loss (无梯度)
+        """
+        # [AMP优化] 强制 FP32
+        targets = targets.float()
+
+        batch_size = targets.shape[0]
+
+        # 用于收集按顺序计算的各组 loss，最后拼接
+        loss_parts = []
+
+        # 遍历 self.tasks (Python 3.7+ 字典保持插入顺序，这很重要)
+        # 顺序必须与 YAML 配置及 targets 的列顺序一致
+        for task_name, meta in self.tasks.items():
+            start = meta['start']
+            end = meta['end']
+
+            # --- A. 获取 Targets (始终切片) ---
+            group_targets = targets[:, start:end]
+
+            # --- B. 获取 Logits (兼容 Dict 和 Tensor) ---
+            if isinstance(logits, dict):
+                # 情况 1: 输入是 Dict
+                if task_name not in logits:
+                    raise ValueError(f"Task '{task_name}' missing in logits dict.")
+                group_logits = logits[task_name]
+
+                # 兼容性处理：如果字典里存的是 list (MultiTaskLoss 的历史遗留)
+                if isinstance(group_logits, list):
+                    group_logits = torch.cat(group_logits, dim=1)
+
+            else:
+                # 情况 2: 输入是展平 Tensor
+                group_logits = logits[:, start:end]
+
+            # 确保类型匹配 (防御性编程)
+            group_logits = group_logits.float()
+
+            # --- C. 计算 Loss ---
+            criterion = self.criteria[task_name]
+
+            # 确保 criterion 的 reduction 属性是 'none' 或 None
+            # BCEWithLogitsLoss 的 reduction 属性是字符串
+            # 自定义 BinaryFocalLoss 的 reduction 属性也是字符串
+            if hasattr(criterion, 'reduction') and criterion.reduction != 'none':
+                # 如果父类初始化时没设为 none，这里临时警告或强制修改（通常父类初始化已设为 none）
+                criterion.reduction = None
+
+            # 返回形状: [Batch, Group_Num_Classes]
+            group_loss = criterion(group_logits, group_targets)
+
+            loss_parts.append(group_loss)
+
+        # --- D. 拼接回大矩阵 ---
+        # 结果形状: [Batch, Total_Subtasks]
+        loss_matrix = torch.cat(loss_parts, dim=1)
+
+        return loss_matrix

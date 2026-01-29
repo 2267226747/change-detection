@@ -41,7 +41,7 @@ class VisionEncoder(nn.Module):
                 param.requires_grad = False
 
         # 从 cfg 读取维度，或从模型配置读取
-        self.output_dim = self.model.config.hidden_size
+        self.output_dim = self.model.rl_config.hidden_size
 
         # 校验 cfg 中的维度是否与模型一致 (防止写错配置文件)
         if cfg.model.vision.feature_dim != self.output_dim:

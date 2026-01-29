@@ -3,6 +3,8 @@ import argparse
 import os
 from types import SimpleNamespace
 import yaml
+import sys
+from utils.logger import setup_logger
 
 # 引入你的 RL 模块
 from rl.env import RLEnv
@@ -12,10 +14,20 @@ from rl.buffer import RolloutBuffer
 from rl.rewards import RewardCalculator
 from trainer.rl_trainer import PPOTrainer
 
+# 获取项目根目录路径
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+from utils.config import Config
 
-# 引入你的预训练模型定义 (假设在 models 目录下)
-# from models.assembled_model import AssembledFusionModel
-# from utils.dataloader import create_dataloader
+# 预训练模型定义
+from models.model import AssembledFusionModel
+from dataset.dataloader import build_dataloader
+
+
+def get_config_path(config_filename):
+    """根据项目根目录获取配置文件的完整路径"""
+    return os.path.join(project_root, 'configs', config_filename)
+
 
 def get_config():
     """定义超参数"""
@@ -66,67 +78,48 @@ def get_config():
 
 def main():
     # 1. 加载配置
-    cfg = get_config()
+    cfg = Config.from_yaml(get_config_path("defaults.yaml"))
     print("Configuration loaded.")
+
+    # 加载logger
+    logger = setup_logger(getattr(cfg.train, 'save_dir', './results/'))
 
     # 2. 准备数据 (Mockup)
     # 这里需要替换为你真实的数据加载逻辑
     # 关键点: batch_size 对应并行环境数, drop_last=True
-    print("Loading data...")
-    # train_loader = create_dataloader(batch_size=32, shuffle=True, drop_last=True)
-    # 模拟一个 DataLoader
-    train_loader = [
-        {
-            'pixel_values_1': torch.randn(32 * 256, 3, 224, 224),  # 假设 N=256 patches
-            'pixel_values_2': torch.randn(32 * 256, 3, 224, 224),
-            'labels': torch.randint(0, 2, (32, 53))  # 假设总共 53 个子任务
-        }
-        for _ in range(10)
-    ]  # 仅用于演示代码跑通
+    logger.info("Loading data...")
+    train_loader = build_dataloader(cfg, split='train')
 
     # 3. 加载预训练模型 (Mockup)
-    print("Loading pretrained model...")
+    logger.info("Loading pretrained model...")
 
-    # pretrained_model = AssembledFusionModel(model_cfg)
-    # pretrained_model.load_state_dict(torch.load("path/to/pretrained.pth"))
-    # pretrained_model.to(cfg.device)
+    pretrained_model = AssembledFusionModel(cfg)
+    pretrained_model.load_state_dict(torch.load("path/to/pretrained.pth"))
+    pretrained_model.to(cfg.device)
 
-    # 假设这里有一个 Mock 对象用于演示
-    class MockModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.class_heads = torch.nn.ModuleList([torch.nn.Linear(10, 10) for _ in range(6)])
-            # 必须模拟必要的属性
-            self.full_cfg = SimpleNamespace(data=SimpleNamespace(patches_num=256))
-            self.start_classify = 1
-            self.class_heads[0].group_names = ['road', 'building']
-            self.class_heads[0].sub_counts = [2, 3]  # Total=5
-
-        def parameters(self): return iter([torch.randn(1)])  # Dummy
-
-    pretrained_model = MockModel().to(cfg.device)
+    rl_cfg = cfg.rl
 
     # 4. 实例化环境
-    env = TransformerRLEnv(
+    env = RLEnv(
         pretrained_model=pretrained_model,
-        config=cfg,
-        device=cfg.device,
-        freeze_classifier=cfg.freeze_classifier
+        config=rl_cfg,
+        device=rl_cfg.device,
+        logger=logger
     )
-    print("Environment initialized.")
+    logger.info("Environment initialized.")
 
     # 5. 定义网络形状 (用于构建 RL Network)
     # 根据 Env 实际解析出的结构
     env_shapes = {
-        'query_dim': 1024,  # 需与预训练模型一致
-        'vision_dim': 1024,
+        'query_dim': getattr(rl_cfg, 'query_dim', 1024),  # 需与预训练模型一致
+        'vision_dim': getattr(rl_cfg, 'vision_dim', 2048),
         'num_groups': env.num_groups,
-        'tokens_per_group': env.batch_size // env.num_groups if env.batch_size > 0 else 256,  # 动态获取或硬编码
+        'tokens_per_group': getattr(rl_cfg, 'tokens_per_task', 256),
         'total_subtasks': env.total_subtasks
     }
 
     # 6. 实例化 Actor-Critic Network
-    network = ActorCriticNetwork(cfg, env_shapes).to(cfg.device)
+    network = ActorCriticNetwork(rl_cfg, env_shapes).to(rl_cfg.device)
 
     # 7. 实例化 Agent
     # [关键] 传入分类头引用和参数，实现联合优化
@@ -135,13 +128,13 @@ def main():
         classifier_heads=env.model.class_heads,
         classifier_params=env.get_classifier_parameters(),
         config=cfg
-    ).to(cfg.device)
+    ).to(rl_cfg.device)
 
     # 8. 实例化辅助组件
     # Buffer: 注意 buffer_size = num_steps * env_batch_size
     # 这里 env_batch_size 是隐式的 (由 train_loader 的 batch_size 决定)
     # 我们可以等到 reset 后获取，或者在 config 里硬编码 rl_batch_size
-    buffer = RolloutBuffer(cfg, env_shapes, device=cfg.device)
+    buffer = RolloutBuffer(rl_cfg, device=rl_cfg.device)
 
     # Reward Calculator: 需要传入 Group Names 以保证权重顺序对齐
     # 假设 cfg 里有 reward_config
@@ -149,7 +142,7 @@ def main():
 
     # 9. 实例化 Trainer
     trainer = PPOTrainer(
-        config=cfg,
+        config=rl_cfg,
         agent=agent,
         env=env,
         buffer=buffer,

@@ -35,6 +35,7 @@ class MultiModalFeatureExtractor(nn.Module):
         # 输入维度: Total_Subtasks (Entropy) + Total_Subtasks (Probs) + 1 (Time)
         context_input_dim = env_shapes['total_subtasks'] * 2 + 1
         self.context_mlp = nn.Sequential(
+            nn.Linear(context_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU()
         )
@@ -44,7 +45,7 @@ class MultiModalFeatureExtractor(nn.Module):
         self.fusion_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU()
+            nn.GELU()
         )
 
     def forward(self, obs):
@@ -97,12 +98,18 @@ class ActorCriticNetwork(nn.Module):
             nn.Tanh()  # Action Scaling: 限制输出在 [-1, 1]
         )
         # LogStd 是可学习参数，初始值设为 0 (std=1) 或 -0.5, []
-        self.correction_logstd = nn.Parameter(torch.ones(1, env_shapes['query_dim']) * -0.5)
+        # 优化：Per-Group LogStd
+        self.correction_logstd = nn.Parameter(
+            torch.ones(1, env_shapes['num_groups'], env_shapes['query_dim']) * -0.5
+        )
 
         # 2. Stop Head (Global Discrete)
         # 输入: [B, G*H] -> MLP -> 输出: Logits [B, Total_Subtasks]
+        # 修改 Stop Head 输入维度：Hidden特征 + 显式的强信号
+        stop_input_dim = (hidden_dim * env_shapes['num_groups']) + (env_shapes['total_subtasks'] * 2)
+
         self.stop_head = nn.Sequential(
-            nn.Linear(hidden_dim * env_shapes['num_groups'], hidden_dim),
+            nn.Linear(stop_input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, env_shapes['total_subtasks'])
         )
@@ -142,7 +149,12 @@ class ActorCriticNetwork(nn.Module):
         corr_logstd = self.correction_logstd.expand_as(corr_mean)  # [B, G, D]
 
         # 2. Stop 分布参数
-        stop_logits = self.stop_head(flat_feat)  # [B, Total]
+        # --- 优化：拼接原始 Context 信息 ---
+        # explicit_signals: [B, Total*2]
+        explicit_signals = torch.cat([obs['entropy'], obs['probs']], dim=-1)
+        # stop_input: [B, G*H + Total*2]
+        stop_input = torch.cat([flat_feat, explicit_signals], dim=-1)
+        stop_logits = self.stop_head(stop_input)
 
         # 3. State Value
         value = self.value_head(flat_feat)  # [B, 1]

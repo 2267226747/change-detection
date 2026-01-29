@@ -153,6 +153,7 @@ train:
 # 5. 强化学习 (RL - Step 2)
 # -------------------------
 rl:
-  lr: 3e-4
-  gamma: 0.99
-  action_dim: 2                   # Gate 动作维度 (例如 0~1 连续值 或 离散)
+  query_dim: 1024
+  tokens_per_task: 256
+  vision_dim: 2048
+  hidden_dim:

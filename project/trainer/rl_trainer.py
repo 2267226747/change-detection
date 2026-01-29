@@ -79,18 +79,18 @@ class PPOTrainer:
                 # return: dict_action, raw_corr, stop, log_prob, value
                 action, raw_corr, stop, log_prob, value = self.agent.get_action(obs)
 
-            # 2. Env 执行
-            next_obs, _, dones, info = self.env.step(action)
+                # 2. Env 执行
+                next_obs, _, dones, info = self.env.step(action)
 
-            # 3. 计算 Reward (使用 info 中的 pre_action_mask)
-            # 注意：传入 Env 中锁定的 final_logits
-            rewards, r_info = self.reward_calc.compute_reward(
-                logits=self.env.final_logits,
-                labels=batch_labels,
-                stop_decision=stop,
-                pre_action_mask=info['pre_action_mask'],  # [Key] 使用旧 Mask
-                done_mask=dones
-            )
+                # 3. 计算 Reward (使用 info 中的 pre_action_mask)
+                # 注意：传入 Env 中锁定的 final_logits
+                rewards, r_info = self.reward_calc.compute_reward(
+                    logits=self.env.final_logits.detach(),  # 显式 detach 增强安全性,
+                    labels=batch_labels,
+                    stop_decision=stop,
+                    pre_action_mask=info['pre_action_mask'],  # [Key] 使用旧 Mask
+                    done_mask=dones
+                )
 
             # 记录统计
             current_ep_reward += rewards
@@ -98,6 +98,10 @@ class PPOTrainer:
             # 4. 存入 Buffer
             # 注意：buffer 需要存 raw_correction 用于后续计算分布
             buffer_action = {'correction': raw_corr, 'stop': stop}
+            # 修正后
+            # 确保 step_indices 是一个形状为 [Batch] 的 Tensor
+            # 假设当前 step 对所有 batch 样本都是一样的
+            step_indices_tensor = torch.full((self.env.batch_size,), info['step'], dtype=torch.long, device='cpu')
 
             self.buffer.add(
                 obs=obs,
@@ -108,7 +112,7 @@ class PPOTrainer:
                 value=value,
                 cls_input_q=info['cls_input_q'],
                 labels=batch_labels,
-                step_indices=info['step']
+                step_indices=step_indices_tensor
             )
 
             # 更新 Obs

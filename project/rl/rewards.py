@@ -1,6 +1,7 @@
 # 专门定义 Reward 计算函数 (基于 Loss 或 评价指标)
 import torch
 import torch.nn as nn
+from utils.loss import RLLoss
 
 
 class RewardCalculator:
@@ -9,14 +10,27 @@ class RewardCalculator:
         支持细粒度类别权重的奖励计算器
 
         Args:
-            config: 包含 tasks 配置的对象 (即你提供的 YAML 结构)
+            rl_config: 包含 tasks 配置的对象 (即你提供的 YAML 结构)
             env_group_names: List[str], Env 中定义的 Group 顺序 (e.g., ['road', 'building', ...])
                              必须传入此参数以确保权重顺序与 Logits 顺序一致！
         """
+        rl_config = config.rl
         # 基础标量配置
-        self.neg_weight = getattr(config, 'reward_neg_weight', 1.0)  # TN 奖励
-        self.wrong_penalty = getattr(config, 'reward_wrong_penalty', -1.0)  # 错误惩罚
-        self.time_penalty = getattr(config, 'time_penalty', 0.02)  # 时间惩罚
+        self.neg_weight = getattr(rl_config, 'reward_neg_weight', 1.0)  # TN 奖励
+        self.wrong_penalty = getattr(rl_config, 'reward_wrong_penalty', -1.0)  # 错误惩罚
+        self.time_penalty = getattr(rl_config, 'time_penalty', 0.02)  # 时间惩罚
+
+        # ====[ 新增配置: 区分停止类型 ]====
+        # 当任务因超时而被动终止时的惩罚 (如果预测错误)
+        # 设为 0.0 意味着不惩罚"非战之罪"
+        self.forced_stop_penalty = getattr(rl_config, 'forced_stop_penalty', 0.0)
+
+        # ====[ 新增配置: 奖励整形 ]====
+        self.use_reward_shaping = getattr(rl_config, 'use_reward_shaping', True)
+        self.shaping_coef = getattr(rl_config, 'shaping_coef', 0.1)
+
+        # ====[ 新增配置: 奖励缩放 ]====
+        self.use_reward_scaling = getattr(rl_config, 'use_reward_scaling', True)
 
         # ====================================================
         # 解析并展平 pos_weight
@@ -27,10 +41,10 @@ class RewardCalculator:
         # 必须按照 Env 定义的 Group 顺序遍历
         for group_name in env_group_names:
             # 获取该 Group 的配置 (兼容 dict 或属性访问)
-            if isinstance(config.tasks, dict):
-                group_cfg = config.tasks.get(group_name)
+            if isinstance(rl_config.tasks, dict):
+                group_cfg = rl_config.tasks.get(group_name)
             else:
-                group_cfg = getattr(config.tasks, group_name, None)
+                group_cfg = getattr(rl_config.tasks, group_name, None)
 
             if group_cfg is None:
                 raise ValueError(f"Group '{group_name}' not found in reward config tasks!")
@@ -50,6 +64,18 @@ class RewardCalculator:
         self.pos_weight_tensor = torch.tensor(pos_weight_list, dtype=torch.float32)
         self.total_subtasks = len(pos_weight_list)
 
+        # --- 奖励整形所需的状态 ---
+        # 使用 reduction='none' 获取每个样本每个任务的 loss
+        self.cls_criterion = RLLoss(config)
+        self.last_cls_loss = None  # 用于存储上一步的损失
+
+    def reset(self):
+        """
+        在每个 episode 开始时重置状态。
+        必须在 env.reset() 后调用此方法。
+        """
+        self.last_cls_loss = None
+
     def compute_reward(self, logits, labels, stop_decision, pre_action_mask, done_mask):
         """
         计算单步奖励
@@ -65,6 +91,8 @@ class RewardCalculator:
         # 确保权重 Tensor 在正确的设备上
         if self.pos_weight_tensor.device != device:
             self.pos_weight_tensor = self.pos_weight_tensor.to(device)
+        if self.cls_criterion.device != device:
+            self.cls_criterion = self.cls_criterion.to(device)
 
         # 1. 确定结算状态 (Settling)
         # 逻辑：原本是 Active (True) 且 Agent 喊停 (Stop=1)
@@ -78,6 +106,9 @@ class RewardCalculator:
         # [修正] 只有决定继续跑的任务，才扣除时间惩罚。
         # 如果 Agent 决定 Stop，因为 Action-First 机制，这层 Transformer 没跑，所以不扣分。
         is_running = pre_action_mask & (stop_decision == 0)
+
+        # [新增] 区分被动终止: 任务本想继续，但 episode 结束了
+        is_forced_stop = pre_action_mask & done_expanded & (stop_decision == 0)
 
         # 3. 预测结果
         preds = (logits > 0).float()
@@ -95,7 +126,11 @@ class RewardCalculator:
         # 1. 成功奖励矩阵 (假设全都预测对了)
         # [B, Total] = [Total] * [B, Total] (广播) + [Scalar] * [B, Total]
         success_rewards = (self.pos_weight_tensor * is_positive_label.float()) + (
-                    self.neg_weight * (~is_positive_label).float())
+                self.neg_weight * (~is_positive_label).float())
+
+        # [优化] 根据停止类型，使用不同的惩罚
+        final_wrong_penalty = torch.full_like(logits, self.wrong_penalty)
+        final_wrong_penalty[is_forced_stop] = self.forced_stop_penalty  # 对被动终止使用更温和的惩罚
 
         # 2. 最终分类奖励矩阵
         # 如果预测正确 -> 取 success_rewards
@@ -103,7 +138,7 @@ class RewardCalculator:
         clf_rewards = torch.where(
             is_correct,
             success_rewards,
-            torch.tensor(self.wrong_penalty, device=device)
+            final_wrong_penalty
         )
 
         # 3. Masking: 只有结算时刻才给分类奖励，否则为 0
@@ -118,14 +153,55 @@ class RewardCalculator:
         time_rewards[is_running] = -self.time_penalty
 
         # ====================================================
-        # C. 汇总
+        # C. [新增] 奖励整形 (Potential-Based Reward Shaping)
         # ====================================================
-        total_matrix = final_clf_rewards + time_rewards
-        step_rewards = total_matrix.sum(dim=1)  # [B]
+        shaping_rewards = torch.zeros_like(logits)
+        if self.use_reward_shaping:
+            # 只在活跃的任务上计算 loss "潜力"
+            # 注意：这里的 loss 是基于当前 logits，即 Agent 采取 action *之后* 的状态
+            current_loss = self.cls_criterion(logits, labels.float())
+            # 用 mask 将非活跃任务的 loss 清零
+            masked_current_loss = current_loss * pre_action_mask.float()
+
+            # 如果不是第一步
+            if self.last_cls_loss is not None:
+                # 潜力变化 = -(新Loss - 旧Loss) = 旧Loss - 新Loss
+                potential_diff = self.last_cls_loss - masked_current_loss
+                shaping_rewards = self.shaping_coef * potential_diff
+
+            # 更新状态，为下一步做准备
+            self.last_cls_loss = masked_current_loss.detach()  # detach很重要，防止梯度穿越episodes
+        else:
+            # 只有在不使用 shaping 时才需要一个占位符
+            # 如果后续汇总总是 .sum(dim=1)，甚至可以用一个标量0
+            shaping_rewards = torch.tensor(0.0, device=device)
+
+        # ====================================================
+        # D. 汇总与缩放 (新代码，根据你的建议优化)
+        # ====================================================
+
+        # 分项进行缩放
+        if self.use_reward_scaling:
+            # 获取每批中结算/活跃的任务数，用于归一化，避免除以0
+            num_settling = is_settling.sum(dim=1).float()
+            num_active_pre = pre_action_mask.sum(dim=1).float()  # shaping 基于 pre_action_mask
+
+            # 如果有任务结算，则对分类奖励进行缩放；否则分类奖励本身就是0
+            scaled_clf_reward = final_clf_rewards.sum(dim=1) / (num_settling + 1e-6)
+
+            # 如果有任务活跃，则对整形奖励进行缩放；否则整形奖励也是0
+            scaled_shaping_reward = shaping_rewards.sum(dim=1) / (num_active_pre + 1e-6)
+
+            # 时间惩罚已经是 per-task 的，直接加总即可，它天然地反映了代价
+            step_rewards = scaled_clf_reward + time_rewards.sum(dim=1) + scaled_shaping_reward
+        else:
+            step_rewards = final_clf_rewards.sum(dim=1) + time_rewards.sum(dim=1) + shaping_rewards.sum(dim=1)
 
         # Logging Info
         info = {
             'reward/step_mean': step_rewards.mean().item(),
+            'reward/clf_reward_mean': (final_clf_rewards.sum(dim=1) / (is_settling.sum(dim=1) + 1e-6)).mean().item(),
+            'reward/shaping_reward_mean': (shaping_rewards.sum(dim=1) / (num_active_pre + 1e-6)).mean().item(),
             'reward/settled_acc': 0.0
         }
         if is_settling.any():

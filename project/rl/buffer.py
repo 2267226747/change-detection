@@ -4,7 +4,7 @@ from collections import defaultdict
 
 
 class RolloutBuffer:
-    def __init__(self, config, env_shapes, device):
+    def __init__(self, config, device):
         """
         PPO Rollout Buffer，支持 Dict Observation 和 Dict Action
         """
@@ -29,8 +29,8 @@ class RolloutBuffer:
         self.dones_storage = []
         self.values_storage = []
         self.cls_query_storage = []
-        self.labels_storge = []
-        self.step_indices_storge = []
+        self.labels_storage = []
+        self.step_indices_storage = []
 
         self.ptr = 0  # 当前存储指针
 
@@ -56,8 +56,8 @@ class RolloutBuffer:
 
         # 专门存一个用于分类训练的 Query
         self.cls_query_storage.append(cls_input_q.detach().cpu())
-        self.labels_storge.append(labels.detach().cpu())
-        self.step_indices_storge.append(step_indices.detach().cpu())
+        self.labels_storage.append(labels.detach().cpu())
+        self.step_indices_storage.append(step_indices.detach().cpu())
 
         self.ptr += 1
 
@@ -131,6 +131,19 @@ class RolloutBuffer:
         # 2. 优势标准化 (Advantage Normalization) - PPO 标准操作
         flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
 
+        # Cls Query
+        flat_cls_query = torch.stack(self.cls_query_storage).to(self.device)
+        # view(-1, *shape[2:]) 可以自动处理除 Time 和 Batch 以外的剩余维度
+        flat_cls_query = flat_cls_query.view(-1, *flat_cls_query.shape[2:])
+
+        # Labels
+        flat_labels = torch.stack(self.labels_storage).to(self.device)
+        flat_labels = flat_labels.view(-1, *flat_labels.shape[2:])
+
+        # Step Indices
+        flat_step_indices = torch.stack(self.step_indices_storage).to(self.device)
+        flat_step_indices = flat_step_indices.view(-1, *flat_step_indices.shape[2:])
+
         # 3. 生成 Mini-batch 索引
         total_samples = flat_returns.shape[0]
         indices = np.arange(total_samples)
@@ -151,9 +164,9 @@ class RolloutBuffer:
                 'values': flat_values[mb_indices],
                 'returns': flat_returns[mb_indices],
                 'advantages': flat_advantages[mb_indices],
-                'cls_query': flat_cls_query[mb_indices],  # [B, N, 2D]
-                'labels': ,
-                'step_indices':
+                'cls_query': flat_cls_query[mb_indices],
+                'labels': flat_labels[mb_indices],
+                'step_indices': flat_step_indices[mb_indices]
             }
 
     def __len__(self):

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, Bernoulli
-from utils.loss import MultiTaskLoss
+from utils.loss import RLLoss
 
 
 class PPOAgent(nn.Module):
@@ -19,7 +19,7 @@ class PPOAgent(nn.Module):
         super().__init__()
         self.network = network
         self.classifier_heads = classifier_heads
-        self.config = config
+        self.rl_config = config.rl
 
         # 将分类头参数加入优化器
         # 注意：这里我们将 agent 参数和 classifier 参数合并管理
@@ -28,12 +28,12 @@ class PPOAgent(nn.Module):
         # 优化器
         self.optimizer = torch.optim.AdamW(
             all_params,
-            lr=config.lr,
+            lr=self.rl_config.lr,
             eps=1e-5,
-            weight_decay=config.weight_decay
+            weight_decay=self.rl_config.weight_decay
         )
 
-        self.cls_criterion = MultiTaskLoss(config).to(self.device)
+        self.cls_criterion = RLLoss(config).to(self.device)
 
     def get_action(self, obs, deterministic=False):
         """
@@ -60,7 +60,7 @@ class PPOAgent(nn.Module):
         # [Action Scaling]
         # 网络输出在 [-1, 1]，我们需要将其映射到实际的 Query 修正幅度
         # 例如 action_scale = 0.1，则最大修正量为 0.1
-        scaled_correction = correction_sample * self.config.action_scale
+        scaled_correction = correction_sample * self.rl_config.action_scale
 
         # --- B. Stop (Discrete) ---
         dist_stop = Bernoulli(logits=stop_logits)
@@ -144,15 +144,15 @@ class PPOAgent(nn.Module):
 
         # 3. 计算 Surrogate Loss (CLIP)
         surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.config.clip_param, 1.0 + self.config.clip_param) * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.rl_config.clip_param, 1.0 + self.rl_config.clip_param) * advantages
         policy_loss = -torch.min(surr1, surr2).mean()
 
         # 4. 计算 Value Loss (MSE)
         # 可选：Value Clip
-        if self.config.use_value_clip:
+        if self.rl_config.use_value_clip:
             old_values = rollouts['values']
             value_pred_clipped = old_values + (values.squeeze(-1) - old_values).clamp(
-                -self.config.clip_param, self.config.clip_param
+                -self.rl_config.clip_param, self.rl_config.clip_param
             )
             value_loss_1 = (values.squeeze(-1) - returns).pow(2)
             value_loss_2 = (value_pred_clipped - returns).pow(2)
@@ -211,7 +211,7 @@ class PPOAgent(nn.Module):
                 # logits_flat = self._flatten_logits(logits_dict)
 
                 # 计算 Loss
-                loss_step = self.cls_criterion(logits_dict, labels_masked.float())
+                loss_step = self.cls_criterion(logits_dict, labels_masked.float()).mean(dim=0)
                 cls_loss += loss_step
 
             # 平均化 Loss
@@ -221,9 +221,9 @@ class PPOAgent(nn.Module):
         # L = L_policy + c1 * L_value + c2 * L_entropy
         total_loss = (
                 policy_loss
-                + self.config.value_loss_coef * value_loss
-                + self.config.entropy_coef * entropy_loss
-                + self.config.cls_loss_coef * cls_loss
+                + self.rl_config.value_loss_coef * value_loss
+                + self.rl_config.entropy_coef * entropy_loss
+                + self.rl_config.cls_loss_coef * cls_loss
         )
 
         # 7. 反向传播
@@ -231,7 +231,7 @@ class PPOAgent(nn.Module):
         total_loss.backward()
 
         # 梯度裁剪 (防止爆炸)
-        nn.utils.clip_grad_norm_(self.network.parameters(), self.config.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.network.parameters(), self.rl_config.max_grad_norm)
 
         self.optimizer.step()
 
@@ -243,3 +243,4 @@ class PPOAgent(nn.Module):
             'loss/cls': cls_loss.item(),
             'meta/approx_kl': (old_log_probs - new_log_probs).mean().item()  # 监控 KL 散度
         }
+
