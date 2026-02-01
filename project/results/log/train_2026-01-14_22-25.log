@@ -1,9 +1,0 @@
-[2026-01-14 22:25:00] [INFO] Using Device: cuda
-[2026-01-14 22:25:00] [INFO] Save Directory: ./model/project/results/
-[2026-01-14 22:25:00] [INFO] AMP Enabled: True, Dtype: torch.bfloat16
-[2026-01-14 22:25:00] [INFO] Building DataLoaders...
-[2026-01-14 22:25:00] [INFO] Building Model...
-[2026-01-14 22:25:06] [INFO] Model Params: Total 1142.78M, Trainable 838.76M, Frozen 304.01M
-[2026-01-14 22:25:06] [INFO] No latest checkpoint found. Starting from scratch.
-[2026-01-14 22:25:06] [INFO] Starting Training Loop...
-[2026-01-14 22:25:06] [INFO] =============== Epoch 1/100 ===============
