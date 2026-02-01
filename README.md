@@ -1,6 +1,3 @@
-这是一个基于 **InternViT** 视觉主干、**Transformer** 融合架构以及 **强化学习 (RL)** 微调的多任务变化检测项目。项目旨在处理街景影像（SVI）或其他图像对，识别并分类包括道路、建筑、绿化和基础设施在内的多种变化类型。
-
-
 ```markdown
 # Change Detection Project with InternViT & RL
 
@@ -15,20 +12,20 @@
 此外，项目引入了 **强化学习 (PPO 算法)** 模块，用于在预训练模型的基础上进一步微调策略，优化模型的推理过程（如动态 Query 修正与推理终止决策）。
 
 ### 核心特性
-* **多任务学习 (Multitask Learning)**: 同时处理 Road, Building, Greenery, Infrastructure 四大类共 31 个子任务的变化检测。
-* **Sensing-Reasoning 架构**: 独特的 Transformer 结构，交替进行视觉感知 (Sensing, Cross-Attn) 与 逻辑推理 (Reasoning, Self-Attn)。
-* **深度监督 (Deep Supervision)**: 在多个推理层级挂载分类头，提升中间层特征的判别能力。
-* **强化学习微调 (RL Fine-tuning)**: 集成 PPO Agent，支持联合优化分类头与策略网络，具备动态修正 Query 的能力。
-* **InternViT 主干**: 利用 InternViT-300M 强大的视觉特征提取能力。
+* **多任务学习 (Multitask Learning)**: 同时处理 Road, Building, Greenery, Infrastructure 四大类共 31 个子任务的变化检测.
+* **Sensing-Reasoning 架构**: 独特的 Transformer 结构，交替进行视觉感知 (Sensing, Cross-Attn) 与 逻辑推理 (Reasoning, Self-Attn).
+* **深度监督 (Deep Supervision)**: 在多个推理层级挂载分类头，提升中间层特征的判别能力.
+* **强化学习微调 (RL Fine-tuning)**: 集成 PPO Agent，支持联合优化分类头与策略网络，具备动态修正 Query 的能力.
+* **InternViT 主干**: 利用 InternViT-300M 强大的视觉特征提取能力，支持 Pixel Unshuffle 和 MLP 投影.
 
 ---
 
 ## 🏗️ 技术架构 (Technical Architecture)
 
 ### 核心组件
-* **Vision Encoder**: 基于 `InternViT-300M-448px-V2_5`，支持 Pixel Unshuffle 和 MLP 投影。
+* **Vision Encoder**: 基于 `InternViT-300M-448px-V2_5`，支持冻结参数与层选择.
 * **Fusion Transformer**: 包含 `FusionTransformerBlock2`，支持 FlashAttention 加速。
-* **RL Agent**: 基于 PPO (Proximal Policy Optimization) 的 Actor-Critic 网络，输出连续动作 (Correction) 和 离散动作 (Stop)。
+* **RL Agent**: 基于 PPO (Proximal Policy Optimization) 的 Actor-Critic 网络，输出连续动作 (Correction) 和 离散动作 (Stop).
 
 ### 模型流向图
 ```mermaid
@@ -82,11 +79,13 @@ graph TD
 │   ├── model.py            # 主模型 AssembledFusionModel
 │   ├── vision/             # 视觉主干 (backbone.py)
 │   ├── transformer/        # Transformer 块与 Attention 实现
-│   └── heads/              # 多任务分类头
+│   ├── heads/              # 多任务分类头
+│   └── position_embedding_v2.py # 位置编码
 ├── rl/                     # 强化学习模块
 │   ├── agent.py            # PPOAgent (Actor-Critic, Update Logic)
 │   ├── env.py              # RL 环境封装
 │   ├── buffer.py           # Rollout Buffer
+│   ├── networks.py         # ActorCriticNetwork 定义
 │   └── rewards.py          # 奖励函数计算
 ├── scripts/                # 运行脚本
 │   ├── DL train.py         # 深度学习(监督)训练入口
@@ -128,8 +127,6 @@ pip install flash-attn --no-build-isolation
 
 ```
 
-*(注：`requirements.txt` 可根据实际环境导出)*
-
 ---
 
 ## 🚀 快速开始 (Quick Start)
@@ -139,7 +136,7 @@ pip install flash-attn --no-build-isolation
 请在 `configs/defaults.yaml` 中配置数据路径。数据应包含：
 
 * **图像文件夹**: 存放 T1 和 T2 时刻的图片。
-* **CSV 文件**: 包含文件名索引 (`OID_`, `name_15`, `name_19`) 和 标签列 (`A01_01_label` 等)。
+* **CSV 文件**: 包含文件名索引 (`OID_`, `name_15`, `name_19`) 和 标签列 (`A01_01_label` 等).
 
 **CSV 格式示例:**
 | OID_ | name_15 | name_19 | A01_01_label | ... |
@@ -159,7 +156,7 @@ python scripts/DL\ train.py
 
 ```
 
-*配置调整*: 修改 `configs/defaults.yaml` 中的 `train` 部分参数 (如 `lr`, `batch_size`)。
+*配置调整*: 修改 `configs/defaults.yaml` 中的 `train` 部分参数 (如 `lr`, `batch_size`).
 
 ### 3. 强化学习微调 (RL Stage)
 
@@ -171,31 +168,31 @@ python scripts/RL\ train.py
 
 ```
 
-*注意*: 需在 `configs/defaults.yaml` 的 `rl` 部分指定 `pre_model_path` 为预训练好的模型路径 (e.g., `./results/checkpoints/model_best.pth`)。
+*注意*: 需在 `configs/defaults.yaml` 的 `rl` 部分指定 `pre_model_path` 为预训练好的模型路径 (e.g., `./results/checkpoints/model_best.pth`).
 
 ---
 
 ## 📊 模型输入与输出
 
 * **Input**:
-* `pixel_values_t1`: [Batch, N_patches, 3, 448, 448]
+* `pixel_values_t1`: [Batch, N_patches, 3, 448, 448] (经过 InternViT processor 处理)
 * `pixel_values_t2`: [Batch, N_patches, 3, 448, 448]
 
 
 * **Output**:
 * `all_results`: 字典，包含不同 Reasoning 层的分类结果。
 * Key: `ClassifyLayer_{i}`
-* Value: Logits [Batch, Num_Tasks, 2]
+* Value: Logits [Batch, Num_Tasks, 2].
 
 
 
 ## 📜 许可证 (License)
 
-[待补充 - 建议添加 MIT 或 Apache 2.0 许可证]
+MIT License
 
 ---
 
-*Created by [XR]*
+*Created by Project Team*
 
 ```
 
