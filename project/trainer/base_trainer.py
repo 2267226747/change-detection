@@ -6,6 +6,7 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 import pandas as pd
+from torch.utils.tensorboard import SummaryWriter
 
 # --- 导入自定义模块 ---
 from dataset.dataloader import build_dataloader
@@ -25,53 +26,33 @@ class Trainer:
 
         # 1. 基础设置
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self._set_seed(getattr(cfg, 'seed', 42))
-
-        # 状态变量
-        self.start_epoch = 0
-        self.best_f1 = 0.0
-        self.epochs = getattr(cfg.train, 'epochs', 50)
-        self.val_interval = getattr(cfg.train, 'val_interval', 1)
-
+        self.epochs = getattr(self.cfg.train, 'epochs', 50)
         # 设置保存目录
-        self.save_dir = getattr(cfg.train, 'save_dir', './results/')
+        self.save_dir = getattr(self.cfg.train, 'save_dir', './results/')
         os.makedirs(self.save_dir, exist_ok=True)
-
-        # 用于存储历史记录的列表
-        self.history_metric_dfs = []
-        self.history_loss_dfs = []
-
         # 初始化日志
-        self.logger = setup_logger(self.save_dir)
+        self.logger = setup_logger(self.save_dir, filename="log/DL_training.log")
         self.logger.info(f"Using Device: {self.device}")
         self.logger.info(f"Save Directory: {self.save_dir}")
-
-        # [AMP] 自动判断是否使用 BF16
-        # 如果 GPU 支持 BF16 (如 Ampere 架构)，则启用
-        self.use_amp = getattr(cfg.train, 'use_amp', True)
-        self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        self.logger.info(f"AMP Enabled: {self.use_amp}, Dtype: {self.amp_dtype}")
-        # [AMP] Scaler
-        # BF16 不需要 scaler，FP16 需要。这里为了通用性可以创建一个，如果是 BF16 设 enabled=False
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.amp_dtype == torch.float16))
+        self.writer = SummaryWriter(log_dir=os.path.join(self.save_dir, 'writer'))
 
         # 2. 构建数据
         self.logger.info("Building DataLoaders...")
-        self.train_loader = build_dataloader(cfg, split='train')
-        self.val_loader = build_dataloader(cfg, split='val')
+        self.train_loader = build_dataloader(self.cfg, self.logger, split='train')
+        self.val_loader = build_dataloader(self.cfg, self.logger, split='val')
 
         # 3. 构建模型
         self.logger.info("Building Model...")
-        self.model = AssembledFusionModel(cfg).to(self.device)
+        self.model = AssembledFusionModel(self.cfg, self.logger).to(self.device)
         print(f"加载模型后显存: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
         # 冻结指定层 (必须在构建优化器之前执行)
         self._freeze_layers()
         self._log_model_params()
 
         # 4. 损失函数与评估器
-        self.criterion = MultiTaskLoss(cfg).to(self.device)
-        self.train_evaluator = Evaluator(cfg)
-        self.val_evaluator = Evaluator(cfg)
+        self.criterion = MultiTaskLoss(self.cfg, self.logger).to(self.device)
+        self.train_evaluator = Evaluator(self.cfg)
+        self.val_evaluator = Evaluator(self.cfg)
 
         # 5. 优化器与调度器
         self.optimizer = self._build_optimizer()
@@ -80,8 +61,35 @@ class Trainer:
         # 6. Checkpoint 管理
         self.ckpt_manager = CheckpointManager(self.save_dir, self.logger)
 
+        # 7. trainer配置
+        seed = getattr(self.cfg.train, 'seed', 42)
+        self._set_seed(seed)
+        # 状态变量
+        self.start_epoch = 0
+        self.best_f1 = 0.0
+        self.val_interval = getattr(self.cfg.train, 'val_interval', 1)
+
+        # 用于存储历史记录的列表
+        self.history_metric_dfs = []
+        self.history_loss_dfs = []
+
+        # [AMP] 自动判断是否使用 BF16
+        # 如果 GPU 支持 BF16 (如 Ampere 架构)，则启用
+        self.use_amp = getattr(self.cfg.train, 'use_amp', True)
+        self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # [AMP] Scaler
+        # BF16 不需要 scaler，FP16 需要。这里为了通用性可以创建一个，如果是 BF16 设 enabled=False
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.amp_dtype == torch.float16))
+
+        self.logger.info(f"Seed: {seed}, Epoch: {self.epochs}, Val_interval: {self.val_interval}")
+        self.logger.info(f"AMP Enabled: {self.use_amp}, Dtype: {self.amp_dtype}")
+
         # 尝试自动恢复训练
-        self._resume_training()
+        self.resume_training = getattr(self.cfg.train, 'if_resume_training', False)
+        if self.resume_training:
+            self._resume_training()
+        else:
+            self.logger.info(f"Starting from scratch.")
 
     def _set_seed(self, seed):
         """设置随机种子"""
@@ -135,6 +143,7 @@ class Trainer:
         """构建优化器，自动过滤不需要梯度的参数"""
         lr = getattr(self.cfg.train, 'lr', 1e-4)
         weight_decay = getattr(self.cfg.train, 'weight_decay', 1e-4)
+        self.logger.info(f"Learning rate: {lr}, Weight_decay: {weight_decay}")
 
         # [关键] 仅传入 requires_grad=True 的参数
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
@@ -201,6 +210,63 @@ class Trainer:
         # 根据数字排序: layer_1, layer_3 -> 找 layer_3
         return sorted(layers, key=lambda x: int(x.split('_')[1]))[-1]
 
+    def _log_to_tensorboard(self, df_loss, df_metrics, epoch, split='Train'):
+        """
+        [修改] 记录到 TensorBoard，支持 Group 列
+        Tag 格式: Split/Metric/Layer/Group/SubID
+        """
+        # 1. 确定 Metrics 的最后一层 (用于筛选 Metrics，通常这是我们在乎的层)
+        last_layer_metric = None
+        if not df_metrics.empty:
+            last_layer_metric = self._get_last_layer_name(df_metrics)
+
+        # 2. 确定 Loss 的目标层
+        # 逻辑：优先找和 Metrics 一样的最后一层；如果 Loss 表里没这层（比如只有 AVG_ALL），则退而求其次用 AVG_ALL
+        target_layer_loss = None
+        if not df_loss.empty:
+            loss_layers = df_loss['Layer'].unique()
+            if last_layer_metric in loss_layers:
+                target_layer_loss = last_layer_metric
+            elif 'AVG_ALL' in loss_layers:
+                target_layer_loss = 'AVG_ALL'
+            else:
+                # 如果既没有匹配层也没AVG_ALL，尝试找 Loss 表里最深的一层
+                target_layer_loss = self._get_last_layer_name(df_loss)
+
+        # 3. 记录 Loss
+        if target_layer_loss and not df_loss.empty:
+            # 筛选目标层
+            subset_loss = df_loss[df_loss['Layer'] == target_layer_loss]
+
+            for _, row in subset_loss.iterrows():
+                # 提取字段
+                group = row['Group'] if 'Group' in row else 'Default'
+                sub_id = row['SubID']
+                loss_val = row['Loss']
+
+                # Tag 格式: Train/Loss/AVG_ALL/building/0
+                # 将 Group 加入路径，方便在 TensorBoard 左侧筛选
+                tag = f"{split}/Loss/{target_layer_loss}/{group}/{sub_id}"
+                self.writer.add_scalar(tag, loss_val, epoch)
+
+        # 4. 记录 Metrics
+        if last_layer_metric and not df_metrics.empty:
+            # 筛选最后一层
+            subset_metric = df_metrics[df_metrics['Layer'] == last_layer_metric]
+
+            # 自动识别存在的指标列
+            metric_cols = [c for c in ['Accuracy', 'Precision', 'Recall', 'F1', 'AP'] if c in subset_metric.columns]
+
+            for _, row in subset_metric.iterrows():
+                group = row['Group'] if 'Group' in row else 'Default'
+                sub_id = row['SubID']
+
+                for m in metric_cols:
+                    val = row[m]
+                    # Tag 格式: Train/F1/ClassifyLayer_1/building/0
+                    tag = f"{split}/{m}/{last_layer_metric}/{group}/{sub_id}"
+                    self.writer.add_scalar(tag, val, epoch)
+
     def _save_loss_history_csv(self):
         if not self.history_loss_dfs: return
         full_df = pd.concat(self.history_loss_dfs, ignore_index=True)
@@ -212,6 +278,7 @@ class Trainer:
 
         save_path = os.path.join(self.save_dir, "acc_loss/training_loss_history.csv")
         full_df.to_csv(save_path, index=False)
+        self.logger.info(f"Updated loss history: {save_path}")
 
     def _save_metric_history_csv(self):
         """
@@ -276,7 +343,9 @@ class Trainer:
 
             # 梯度裁剪
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if step == 0:
+                self.logger.info(f"Epoch {epoch} step 0 train/Grad_Norm: {total_norm.item()}")
 
             # 6. 更新参数
             self.scaler.step(self.optimizer)
@@ -380,20 +449,23 @@ class Trainer:
 
             # 获取训练集平均 F1
             last_layer = self._get_last_layer_name(df_train_metrics)
-            train_means = self._get_mean_metrics(df_train_metrics, layer_name=last_layer)
+            # train_means = self._get_mean_metrics(df_train_metrics, layer_name=last_layer)
 
-            log_msg = f"[Train] Metrics: {train_loss:.4f} | Layer: {last_layer} | " + \
-                      " | ".join([f"{k}: {v:.4f}" for k, v in train_means.items()])
-            self.logger.info(log_msg)
             self.logger.info(f"LR: {self.optimizer.param_groups[0]['lr']:.2e}")
 
             # Log 打印 (只打印 AVG_ALL 部分，防止刷屏)
-            # 筛选 Layer=AVG_ALL 且 SubID=MEAN 的行
+            # 筛选 Layer=last_layer
             loss_summary = df_train_loss[
-                (df_train_loss['Layer'] == 'AVG_ALL') &
-                (df_train_loss['SubID'] == 'MEAN')
-                ]
-            self.logger.info(f"[Train Loss Summary]\n{loss_summary.to_string(index=False)}")
+                (df_train_loss['Layer'] == last_layer)
+            ]
+            self.logger.info(f"[Train Loss Summary(last_layer)]\n{loss_summary.to_string(index=False)}")
+            metrics_summary = df_train_metrics[
+                (df_train_metrics['Layer'] == last_layer)
+            ]
+            self.logger.info(f"[Train Metrics Summary(last_layer)]\n{metrics_summary.to_string(index=False)}")
+
+            # [新增] TensorBoard 记录 Train
+            self._log_to_tensorboard(df_train_loss, df_train_metrics, epoch, split='Train')
 
             # 更新学习率
             self.scheduler.step()
@@ -416,20 +488,24 @@ class Trainer:
 
                 # 2. Log 平均层表现 (代表 Deep Supervision 的整体稳定性)
                 val_avg_means = self._get_mean_metrics(df_val_metrics, layer_name='AVG_ALL')
-
-                self.logger.info(f"[Val] Loss: {val_loss:.4f}")
+                self.logger.info(f"[Val] Avg Loss: {val_loss:.4f}")
+                # self.logger.info(
+                # f"   >> Last Layer ({last_layer}) F1: {val_last_means['F1']:.4f} | AP: {val_last_means['AP']:.4f}")
                 self.logger.info(
-                    f"   >> Last Layer ({last_layer}) F1: {val_last_means['F1']:.4f} | AP: {val_last_means['AP']:.4f}")
-                self.logger.info(
-                    f"   >> Avg  Layer (Ensemble)      F1: {val_avg_means['F1']:.4f} | AP: {val_avg_means['AP']:.4f}")
+                    f"   >> Avg  Layer (Ensemble)      | Acc: {val_avg_means['Accuracy']:.4f} | Pre: {val_avg_means['Precision']:.4f} | Recall: {val_avg_means['Recall']:.4f} | F1: {val_avg_means['F1']:.4f} | AP: {val_avg_means['AP']:.4f}")
 
-                # 打印表格时，只打印 AVG_ALL 和 Last Layer，防止刷屏
+                # 打印表格时，只打印 Last Layer，防止刷屏
                 # Log
-                self.logger.info(
-                    f"[Val Loss Details]\n{df_val_loss[df_val_loss['Layer'] == 'AVG_ALL'].to_string(index=False)}")
-                print_df = df_val_metrics[df_val_metrics['Layer'].isin([last_layer, 'AVG_ALL'])]
-                self.logger.info("\n" + print_df.to_string(index=False))
+                loss_summary = df_val_loss[
+                    (df_val_loss['Layer'] == last_layer)
+                ]
+                self.logger.info(f"[Val Loss Summary(last_layer)]\n{loss_summary.to_string(index=False)}")
+                metrics_summary = df_val_metrics[
+                    (df_val_metrics['Layer'] == last_layer)
+                ]
+                self.logger.info(f"[Val Metrics Summary(last_layer)]\n{metrics_summary.to_string(index=False)}")
 
+                self._log_to_tensorboard(df_val_loss, df_val_metrics, epoch, split='Val')
                 # 保存预测结果 (包含所有层)
                 # pred_save_path = os.path.join(self.save_dir, "predictions", f"val_preds_epoch_{epoch}.csv")
                 # self.val_evaluator.save_predictions(pred_save_path)
@@ -451,7 +527,7 @@ class Trainer:
                     epoch=epoch,
                     metric=self.best_f1,
                     is_best=is_best,
-                    filename='latest.pth'
+                    filename='checkpoints/DL_latest.pth'
                 )
             else:
                 # 即使不验证，也保存最新的训练状态以防中断
@@ -462,7 +538,7 @@ class Trainer:
                     epoch=epoch,
                     metric=self.best_f1,
                     is_best=False,
-                    filename='latest.pth'
+                    filename='checkpoints/DL_latest.pth'
                 )
 
             # 每个 Epoch 结束都保存一次总表 (防止意外中断导致数据丢失)

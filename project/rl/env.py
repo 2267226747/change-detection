@@ -15,7 +15,8 @@ class RLEnv:
         self.model = pretrained_model
         self.config = config
         self.device = device
-        self.freeze_classifier = self.config.freeze_classifier
+        self.freeze_classifier = self.config.rl.freeze_classifier
+        logger.info(f"Freeze classifier: {self.freeze_classifier}")
 
         # ====================================================
         # 1. 冻结策略管理
@@ -51,6 +52,10 @@ class RLEnv:
         self.sub_counts = first_head.sub_counts  # list 各个group中子任务的数量 [8, 8,...]
         self.num_groups = len(self.group_names)
         self.total_subtasks = sum(self.sub_counts)
+        logger.info(f"Task group list: {self.group_names}, "
+                    f"Subtask counts: {self.sub_counts}, "
+                    f"Total subtasks: {self.total_subtasks}")
+
 
         # 构建 Group -> Subtasks 索引映射 [[0,1,2...n] [n,n+1,...],...]
         self.group_indices = []
@@ -181,6 +186,38 @@ class RLEnv:
         should_stop = (stop_decision == 1)
         self.subtask_active_mask = self.subtask_active_mask & (~should_stop)
 
+        # ---------------------------------------------------
+        # [优化] 极速短路 (Fast Path)
+        # 如果所有子任务都不活跃了 (都被 Stop 或之前就已经 Done)
+        # 就不需要跑昂贵的 Transformer 和 Classifier 了
+        # ---------------------------------------------------
+        if (~self.subtask_active_mask).all():
+            self.current_step += 1
+
+            # 计算 dones (全是 True，除非 max_steps 还没到且还有任务？不，Mask全False说明都停了)
+            # 注意：这里 dones 的逻辑要和下面保持一致
+            all_stopped = True  # Mask 全 False 意味着全 Stopped
+            max_reached = (self.current_step >= self.max_steps)
+            dones = torch.ones(self.batch_size, dtype=torch.bool, device=self.device)  # All True
+
+            info = {
+                'step': self.current_step,
+                'active_mask': self.subtask_active_mask,
+                'pre_action_mask': pre_subtask_active_mask,  # 依然需要传出去算 Reward
+                'labels': self.current_labels,
+                # 当 skip 时，input_q 保持上一刻的值，或者全0，RewardCalculator 不会用到它
+                'cls_input_q': torch.cat([self.q_t1, self.q_t2], dim=-1)
+            }
+
+            # 占位 Reward
+            rewards = torch.zeros(self.batch_size, device=self.device)
+
+            # 直接返回下一帧 obs (通常这时候 obs 已经是 padding 或者是最终状态的 snapshot)
+            return self._get_observation(), rewards, dones, info
+
+        # ====================================================
+        # 如果还有任务存活，才继续跑下面的重型计算
+        # ====================================================
         # 计算 Group Active Mask (OR 逻辑)
         # group_active_mask: [B, G]
         group_active_mask = torch.zeros((self.batch_size, self.num_groups), dtype=torch.bool, device=self.device)

@@ -12,7 +12,7 @@ class MultiModalFeatureExtractor(nn.Module):
 
         self.num_groups = env_shapes['num_groups']
         self.tokens_per_group = env_shapes['tokens_per_group']
-        hidden_dim = config.hidden_dim
+        hidden_dim = config.rl.hidden_dim
 
         # 1. Query Encoder (处理主要状态)
         # 输入: [B, N, 2D] -> 聚合为 [B, G, 2D] -> MLP -> [B, G, H]
@@ -83,10 +83,10 @@ class MultiModalFeatureExtractor(nn.Module):
 
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, config, env_shapes):
+    def __init__(self, config, env_shapes, logger):
         super().__init__()
         self.feature_extractor = MultiModalFeatureExtractor(config, env_shapes)
-        hidden_dim = config.hidden_dim
+        hidden_dim = config.rl.hidden_dim
 
         # --- Actor Heads ---
 

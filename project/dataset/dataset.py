@@ -11,39 +11,44 @@ import torchvision.transforms.functional as F
 
 
 class SVIPairsDataset(Dataset):
-    def __init__(self, cfg, split='train'):
+    def __init__(self, cfg, logger, split='train'):
         self.cfg = cfg
         self.split = split
 
         # --- 切片配置 ---
         # 在 cfg 中配置这些参数
-        self.min_num = getattr(cfg.data, 'patches_min_num', 1)
-        self.max_num = getattr(cfg.data, 'patches_max_num', 128)
-        self.h_num = getattr(cfg.data, 'patches_h_num', 3)
-        self.w_num = getattr(cfg.data, 'patches_w_num', 9)
-        self.image_patches_size = getattr(cfg.data, 'image_patches_size', 224)
-        self.use_thumbnail = getattr(cfg.data, 'use_thumbnail', True)
+        self.min_num = getattr(self.cfg.data, 'patches_min_num', 1)
+        self.max_num = getattr(self.cfg.data, 'patches_max_num', 128)
+        self.h_num = getattr(self.cfg.data, 'patches_h_num', 3)
+        self.w_num = getattr(self.cfg.data, 'patches_w_num', 9)
+        self.image_patches_size = getattr(self.cfg.data, 'image_patches_size', 224)
+        self.use_thumbnail = getattr(self.cfg.data, 'use_thumbnail', True)
         # ----------------
+        if split == "train":  # 仅在training数据上输出一遍即可
+            logger.info(
+                f"Patches H/W num: {self.h_num}/{self.w_num}, "
+                f"Image patches size: {self.image_patches_size}, "
+                f"Use thumbnaill: {self.use_thumbnail}")
 
         # 路径配置
         if split == 'train':
-            self.image_dir = cfg.data.train_image_dir
-            csv_path = cfg.data.train_csv_path
+            self.image_dir = self.cfg.data.train_image_dir
+            csv_path = self.cfg.data.train_csv_path
         else:
-            self.image_dir = cfg.data.val_image_dir
-            csv_path = cfg.data.val_csv_path
+            self.image_dir = self.cfg.data.val_image_dir
+            csv_path = self.cfg.data.val_csv_path
 
         print(f"[{split.upper()}] Loading metadata from {csv_path} ...")
         self.df = pd.read_csv(csv_path)
 
-        self.col_oid = cfg.data.col_oid
-        self.col_t1 = cfg.data.col_name_t1
-        self.col_t2 = cfg.data.col_name_t2
-        self.label_cols = cfg.data.label_columns
+        self.col_oid = self.cfg.data.col_oid
+        self.col_t1 = self.cfg.data.col_name_t1
+        self.col_t2 = self.cfg.data.col_name_t2
+        self.label_cols = self.cfg.data.label_columns
 
         # 初始化 Processor (来自 model/vision/backbone.py)
         # processor 主要做 Normalize 和 ToTensor
-        # self.processor = VisionEncoder.get_image_processor(cfg.model.vision.backbone)
+        self.processor = VisionEncoder.get_image_processor(cfg.model.vision.backbone)
 
     def __len__(self):
         return len(self.df)
@@ -80,12 +85,12 @@ class SVIPairsDataset(Dataset):
         for patch in patches:
             # processor 处理单张图，返回 dict, 取 pixel_values
             # 这里的 patch 已经是 224x224 了，processor 主要做 Normalize
-            # inputs = self.processor(images=patch, return_tensors='pt', do_resize=False)
-            # pixel_values_list.append(inputs.pixel_values)  # shape [1, 3, 448, 448]
+            inputs = self.processor(images=patch, return_tensors='pt', do_resize=False)
+            pixel_values_list.append(inputs.pixel_values)  # shape [1, 3, 448, 448]
 
-            # test用，不调用internVit processor
-            pixel_values = F.to_tensor(patch)
-            pixel_values_list.append(pixel_values.unsqueeze(0))
+            # # test用，不调用internVit processor
+            # pixel_values = F.to_tensor(patch)
+            # pixel_values_list.append(pixel_values.unsqueeze(0))
 
         # 3. 拼接所有 patches
         # 结果 shape: [Num_Patches, 3, 224, 224]
@@ -115,8 +120,8 @@ class SVIPairsDataset(Dataset):
         labels = torch.tensor(row[self.label_cols].values.astype(float), dtype=torch.float32)
 
         return {
-            'pixel_values_t1': pixel_values_t1,  # [N1, 3, 448, 448]
-            'pixel_values_t2': pixel_values_t2,  # [N2, 3, 448, 448]
+            'pixel_values_t1': pixel_values_t1,  # [N, 3, 448, 448]
+            'pixel_values_t2': pixel_values_t2,  # [N, 3, 448, 448]
             'num_patches_t1': pixel_values_t1.shape[0],  # 记录切了多少块
             'num_patches_t2': pixel_values_t2.shape[0],
             'labels': labels,

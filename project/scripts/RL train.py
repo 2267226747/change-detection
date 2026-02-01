@@ -84,42 +84,43 @@ def main():
     # 加载logger
     logger = setup_logger(getattr(cfg.train, 'save_dir', './results/'))
 
-    # 2. 准备数据 (Mockup)
-    # 这里需要替换为你真实的数据加载逻辑
-    # 关键点: batch_size 对应并行环境数, drop_last=True
+    # 2. 准备数据
     logger.info("Loading data...")
-    train_loader = build_dataloader(cfg, split='train')
+    train_loader = build_dataloader(cfg, logger, split='train')
+    val_loader = build_dataloader(cfg, logger, split='val')
 
     # 3. 加载预训练模型 (Mockup)
     logger.info("Loading pretrained model...")
-
-    pretrained_model = AssembledFusionModel(cfg)
-    pretrained_model.load_state_dict(torch.load("path/to/pretrained.pth"))
-    pretrained_model.to(cfg.device)
-
-    rl_cfg = cfg.rl
+    pretrained_model = AssembledFusionModel(cfg, logger)
+    pretrained_model.load_state_dict(torch.load(cfg.rl.pre_model_path))
+    pretrained_model.to(cfg.rl.device)
 
     # 4. 实例化环境
+    logger.info("Initializing environment...")
     env = RLEnv(
         pretrained_model=pretrained_model,
-        config=rl_cfg,
-        device=rl_cfg.device,
+        config=cfg,
+        device=cfg.rl.device,
         logger=logger
     )
-    logger.info("Environment initialized.")
 
     # 5. 定义网络形状 (用于构建 RL Network)
     # 根据 Env 实际解析出的结构
     env_shapes = {
-        'query_dim': getattr(rl_cfg, 'query_dim', 1024),  # 需与预训练模型一致
-        'vision_dim': getattr(rl_cfg, 'vision_dim', 2048),
-        'num_groups': env.num_groups,
-        'tokens_per_group': getattr(rl_cfg, 'tokens_per_task', 256),
+        'vision_dim': getattr(cfg.model.vision, 'vision_dim', 1024),
+        'query_dim': getattr(cfg.model.query_token, 'query_dim', 1024),  # 需与预训练模型一致
+        'num_groups': getattr(cfg.model.query_token, 'task_nums', 4),
+        'tokens_per_group': getattr(cfg.model.query_token, 'tokens_per_task', 128),
         'total_subtasks': env.total_subtasks
     }
+    logger.info("Initializing Actor-Critic Network...")
+    logger.info(f"Vision token dim: {env_shapes['vision_dim']}, "
+                f"Query token dim: {env_shapes['query_dim']}, "
+                f"Num groups: {env_shapes['num_groups']}, "
+                f"Tokens per group(Query): {env_shapes['tokens_per_group']}")
 
     # 6. 实例化 Actor-Critic Network
-    network = ActorCriticNetwork(rl_cfg, env_shapes).to(rl_cfg.device)
+    network = ActorCriticNetwork(cfg, env_shapes, logger).to(cfg.device)
 
     # 7. 实例化 Agent
     # [关键] 传入分类头引用和参数，实现联合优化

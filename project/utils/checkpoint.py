@@ -19,7 +19,7 @@ class CheckpointManager:
 
         self.logger = logger if logger else logging.getLogger(__name__)
 
-    def save(self, model, optimizer, epoch, metric, scheduler=None, is_best=False, filename='checkpoints/latest.pth'):
+    def save(self, model, optimizer, epoch, metric, scheduler=None, is_best=False, filename='checkpoints/DL_latest.pth'):
         """
         保存检查点
         Args:
@@ -58,9 +58,11 @@ class CheckpointManager:
 
         # 4. 如果是最佳模型，拷贝一份为 model_best.pth
         if is_best:
-            best_path = os.path.join(self.save_dir, 'model_best.pth')
-            shutil.copyfile(filepath, best_path)
-            self.logger.info(f"Saved Best Model (Score: {metric:.4f}) to {best_path}")
+            best_path = os.path.join(self.save_dir, 'checkpoints/model_best.pth')
+            # 不再 copyfile，而是直接保存 model_state
+            # 这样保存的文件不包含 optimizer, epoch 等信息，只有权重张量
+            torch.save(model_state, best_path)
+            self.logger.info(f"Saved Best Model Weights (Score: {metric:.4f}) to {best_path} [Lite Version]")
 
     def load(self, checkpoint_path, model, optimizer=None, scheduler=None, device='cpu'):
         """
@@ -85,14 +87,26 @@ class CheckpointManager:
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
         # 1. 加载模型权重
-        # 处理可能的 key 不匹配 (例如保存时有 'module.', 加载时没有)
-        state_dict = checkpoint['state_dict']
+        # --- 兼容性判断 ---
+        # 如果加载的是 full checkpoint，权重在 ['state_dict'] 里
+        # 如果加载的是 best model (lite)，checkpoint 本身就是 state_dict
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_metric = checkpoint.get('best_metric', 0.0)
+            is_full_checkpoint = True
+        else:
+            # 假设这是纯权重文件
+            state_dict = checkpoint
+            start_epoch = 0
+            best_metric = 0.0
+            is_full_checkpoint = False
+            self.logger.info("Detected inference-only weight file.")
 
         # 简单处理 DataParallel 的前缀问题
         if list(state_dict.keys())[0].startswith('module.') and not hasattr(model, 'module'):
             # 如果权重有 module. 但当前模型没有，去掉前缀
-            new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            state_dict = new_state_dict
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
         # strict=True 保证完全匹配，生产环境建议 True
         # strict=False 允许加载部分权重 (如做迁移学习时)
@@ -104,14 +118,16 @@ class CheckpointManager:
             self.logger.warning(f"Unexpected keys: {unexpected_keys}")
 
         # 2. 加载优化器状态 (仅在恢复训练时需要)
-        if optimizer is not None and 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            self.logger.info("Optimizer state loaded.")
+        # 仅当是完整 Checkpoint 且 传入了 optimizer 时才加载优化器
+        if is_full_checkpoint:
+            if optimizer is not None and 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                self.logger.info("Optimizer state loaded.")
 
-        # 3. 加载调度器状态
-        if scheduler is not None and 'scheduler' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-            self.logger.info("Scheduler state loaded.")
+            # 3. 加载调度器状态
+            if scheduler is not None and 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+                self.logger.info("Scheduler state loaded.")
 
         # 4. 获取元数据
         start_epoch = checkpoint.get('epoch', 0) + 1  # 从下一轮开始
@@ -127,10 +143,10 @@ class CheckpointManager:
         Returns:
             start_epoch, best_metric
         """
-        latest_path = os.path.join(self.save_dir, 'latest.pth')
+        latest_path = os.path.join(self.save_dir, 'checkpoints/DL_latest.pth')
         if os.path.exists(latest_path):
             self.logger.info(f"Found latest checkpoint, resuming...")
             return self.load(latest_path, model, optimizer, scheduler, device)
         else:
-            self.logger.info("No latest checkpoint found. Starting from scratch.")
+            self.logger.info(f"No latest checkpoint found in {latest_path}. Starting from scratch.")
             return 0, 0.0

@@ -6,6 +6,7 @@ from tqdm import tqdm
 from collections import defaultdict, deque
 import os
 import time
+from utils.logger import setup_logger
 
 # 假设使用 tensorboard 记录
 from torch.utils.tensorboard import SummaryWriter
@@ -32,16 +33,16 @@ class PPOTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
 
+        self.logger = setup_logger(config.log_dir)
+
         self.device = config.device
-        self.writer = SummaryWriter(log_dir=config.log_dir)
+        self.writer = SummaryWriter(log_dir=config.writer_dir)
 
         # 将 DataLoader 转为迭代器，以便在 RL 循环中按需获取
         self.train_iter = iter(self.train_loader)
 
         # 统计指标容器
-        self.ep_rewards = deque(maxlen=100)
-        self.ep_lengths = deque(maxlen=100)
-        self.ep_accuracies = deque(maxlen=100)
+        self.train_perf_metrics = defaultdict(lambda: deque(maxlen=100))
 
     def _get_batch_data(self):
         """从 DataLoader 获取下一个 Batch，如果耗尽则重置"""
@@ -122,18 +123,25 @@ class PPOTrainer:
             # 或者让 Env 内部处理 Dummy Step (通常 VectorEnv 会自动 Reset，但这里是单 Batch Env)
             # 鉴于我们的 Env 是处理固定步数 (max_steps)，这里循环通常会跑满 config.num_steps
             # 除非 max_steps < config.num_steps，这里假设 config.num_steps == env.max_steps
+            if dones.all():
+                break
 
         # Rollout 结束，计算 GAE
         # 需要最后一个状态的 Value 来做 Bootstrap
         with torch.no_grad():
             _, _, _, last_value = self.agent.network(next_obs)  # 只取 Value
 
-        self.buffer.compute_returns_and_advantage(last_value, dones)
+        # 记录 Reward (取 Batch 平均)
+        self.train_perf_metrics['reward'].append(current_ep_reward.mean().item())
 
-        # 记录 Episode 统计数据
-        self.ep_rewards.append(current_ep_reward.mean().item())
-        if 'reward/settled_acc' in r_info:
-            self.ep_accuracies.append(r_info['reward/settled_acc'])
+        # 解析 r_info 中的指标
+        # 假设 r_info 包含: {'reward/settled_acc': 0.8, 'reward/settled_f1': 0.7, ...}
+        for k, v in r_info.items():
+            if 'finalall_' in k:
+                # 提取名称: 'reward/settled_f1' -> 'f1'
+                metric_name = k.split('finalall_')[-1]
+                self.train_perf_metrics[metric_name].append(v)
+
 
     def update(self):
         """
@@ -160,11 +168,11 @@ class PPOTrainer:
 
     def train(self):
         """主训练循环"""
-        print(f"Start Training on {self.device}...")
+        self.logger.info(f"Start Training on {self.device}...")
 
         global_step = 0
 
-        for epoch in tqdm(range(self.config.total_epochs)):
+        for epoch in tqdm(range(self.config.total_epochs), desc="Training"):
             # 1. 收集数据
             self.collect_rollouts()
 
@@ -174,14 +182,27 @@ class PPOTrainer:
             # 3. 日志记录
             global_step += self.config.num_steps * self.env.batch_size
 
+            # 构建日志信息
+            loss_msg_parts = [f"Epoch {epoch}"]
             # 记录 Loss
             for k, v in train_metrics.items():
                 self.writer.add_scalar(k, v, epoch)
+                loss_msg_parts.append(f"{k}: {v:.4f}")
 
             # 记录 Rewards & Metrics
-            if len(self.ep_rewards) > 0:
-                self.writer.add_scalar('perf/ep_reward', np.mean(self.ep_rewards), epoch)
-                self.writer.add_scalar('perf/accuracy', np.mean(self.ep_accuracies), epoch)
+            perf_msg_parts = []
+            # 遍历 perf_metrics 中的所有 key (reward, acc, f1, precision...)
+            for k, v_deque in self.train_perf_metrics.items():
+                if len(v_deque) > 0:
+                    # 使用滑动平均写入 TensorBoard
+                    mean_val = np.mean(v_deque)
+                    self.writer.add_scalar(f'perf/{k}', mean_val, epoch)
+                    perf_msg_parts.append(f"{k}: {mean_val:.4f}")
+
+            # 统一输出 Training Loop 日志
+            self.logger.info(" | ".join(loss_msg_parts))
+            if perf_msg_parts:
+                self.logger.info(f"Train Metrics: {' | '.join(perf_msg_parts)}")
 
             # 4. 保存模型
             if (epoch + 1) % self.config.save_interval == 0:
@@ -202,9 +223,115 @@ class PPOTrainer:
             'optimizer_state_dict': self.agent.optimizer.state_dict(),
             'config': self.config,
         }, path)
-        print(f"Saved checkpoint to {path}")
+        self.logger.info(f"Saved checkpoint to {path}")
 
     def evaluate(self, epoch):
-        """验证逻辑 (简略版)"""
-        # 类似于 collect_rollouts，但不更新 buffer，不训练，只记录准确率
-        pass
+        """验证逻辑"""
+        if not self.val_loader:
+            return
+
+        self.logger.info(f"Evaluating at epoch {epoch}...")
+        self.agent.eval()
+        # 如果 env 中有这就切换，没有就不管 (Transformer backbone 通常一直 eval)
+        if hasattr(self.env, 'eval'): self.env.eval()
+
+        # 使用 defaultdict 存储所有出现的指标
+        # Key 例如: 'reward', 'steps', 'acc', 'f1', 'precision'...
+        val_metrics = defaultdict(list)
+
+
+        # 遍历验证集
+        with torch.no_grad():
+            # 使用 tqdm 显示进度
+            pbar = tqdm(self.val_loader, desc=f"Eval Ep{epoch}", leave=False)
+            for batch_data in pbar:
+                # 数据准备
+                # 假设 batch_data['labels'] 是 [B, Total]
+                batch_labels = batch_data['labels'].to(self.device)
+
+                # Reset Env
+                obs = self.env.reset(batch_data)
+
+                # 统计容器
+                batch_rewards = torch.zeros(self.env.batch_size, device=self.device)
+                steps_taken = torch.zeros(self.env.batch_size, device=self.device)  # 记录每个样本跑了多少步
+                active_mask = torch.ones(self.env.batch_size, dtype=torch.bool, device=self.device)  # 记录样本是否还在跑
+
+                # Rollout loop
+                for step in range(self.config.num_steps):
+                    # Agent 决策
+                    action, _, stop, _, _ = self.agent.get_action(obs, deterministic=True)
+
+                    # Env 执行
+                    next_obs, _, dones, info = self.env.step(action)
+
+                    # 3. 记录步数 (只要还没 done，步数就+1)
+                    # 注意：dones 是 [B]，表示该样本所有任务是否都结束
+                    # 如果样本还在跑 (active)，这一步算作有效消耗
+                    steps_taken[active_mask] += 1
+                    active_mask = ~dones  # 更新活跃状态
+
+                    # 4. 计算 Reward (仅作记录)
+                    # 注意：这里我们信任 RewardCalculator 的逻辑，但 Accuracy 我们自己算更准
+                    # 计算 Reward (用于统计指标)
+                    rewards, r_info = self.reward_calc.compute_reward(
+                        logits=self.env.final_logits.detach(),
+                        labels=batch_labels,
+                        stop_decision=stop,
+                        pre_action_mask=info['pre_action_mask'],
+                        done_mask=dones
+                    )
+
+                    batch_rewards += rewards
+                    obs = next_obs
+
+                    # 5. [优化] 提前退出：如果所有样本都结束了，不需要空跑
+                    if dones.all():
+                        break
+
+                # --- Batch 结算 ---
+
+                # 1. 记录基础指标
+                val_metrics['reward'].append(batch_rewards.mean().item())
+                val_metrics['avg_steps'].append(steps_taken.mean().item())
+
+                # 2. 从 final_step_info 中提取高阶指标 (Acc, F1, Rec...)
+                # 假设 r_info key 格式为 "reward/settled_acc" 或 "settled_acc"
+                current_acc = 0.0  # 用于进度条显示
+
+                for k, v in r_info.items():
+                    # 过滤掉不需要记录的中间变量，只保留 settled 指标
+                    if 'finalall_' in k:
+                        # 清洗 key 名称: 'reward/finalall_acc' -> 'acc'
+                        metric_name = k.split('finalall_')[-1]
+                        val_metrics[metric_name].append(v)
+
+                        # 顺便获取 acc 用于显示
+                        if 'acc' in metric_name:
+                            current_acc = v
+                # 更新进度条
+                pbar.set_postfix({
+                    'acc': f"{current_acc:.3f}",
+                    'rew': f"{batch_rewards.mean().item():.2f}"
+                })
+
+            # --- 汇总与日志 ---
+
+            # 计算所有指标的平均值
+            avg_metrics = {k: np.mean(v) for k, v in val_metrics.items()}
+
+            # 打印关键信息 (确保 print 不会报错，使用 get 设置默认值)
+            self.logger.info(f"Eval Ep {epoch}: "
+                  f"Reward={avg_metrics.get('reward', 0):.4f}, "
+                  f"Acc={avg_metrics.get('acc', 0):.4f}, "
+                  f"F1={avg_metrics.get('f1', 0):.4f}, "
+                  f"Steps={avg_metrics.get('avg_steps', 0):.2f}")
+
+            # 写入 TensorBoard
+            for k, v in avg_metrics.items():
+                self.writer.add_scalar(f'eval/{k}', v, epoch)
+
+            # 恢复训练模式
+            self.agent.train()
+
+            return avg_metrics

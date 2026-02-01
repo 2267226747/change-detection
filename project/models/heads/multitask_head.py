@@ -16,7 +16,6 @@ class SubTaskHead(nn.Module):
             nn.LayerNorm(mid_dim),  # 稳定分布，加速收敛
             nn.GELU(),  # 引入非线性
             nn.Dropout(dropout),  # 防止过拟合
-
             # 第二层：最终分类
             nn.Linear(mid_dim, 1)  # 输出 Logits
         )
@@ -26,7 +25,7 @@ class SubTaskHead(nn.Module):
 
 
 class MultitaskClassifier(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, i, logger):
         """
         Args:
             cfg: 全局配置对象 (cfg.model.class_head)
@@ -37,10 +36,10 @@ class MultitaskClassifier(nn.Module):
         head_cfg = cfg.model.class_head
 
         # 2. 从配置中解析参数
-        self.in_dim = getattr(cfg, 'query_dim', 1024)
-        self.hidden_dim = getattr(cfg, 'hidden_dim', 1024)
-        self.mid_hidden_dim = getattr(cfg, 'mid_hidden_dim', 256)
-        self.dropout = getattr(cfg, 'dropout', 0.1)
+        self.in_dim = getattr(head_cfg, 'query_dim', 1024)
+        self.hidden_dim = getattr(head_cfg, 'hidden_dim', 1024)
+        self.mid_hidden_dim = getattr(head_cfg, 'mid_hidden_dim', 256)
+        self.dropout = getattr(head_cfg, 'dropout', 0.1)
 
         # 3. 解析任务字典列表
         # 结构示例: [{road: 8}, {building: 8}, ...]
@@ -59,6 +58,8 @@ class MultitaskClassifier(nn.Module):
                 key = list(item.keys())[0]
                 val = item[key]
 
+            if i == 0:
+                logger.info(f"Task group name {key}, Sub task nums: {val}")
             self.group_names.append(key)
             self.sub_counts.append(val)
 
@@ -87,13 +88,14 @@ class MultitaskClassifier(nn.Module):
             group_heads = nn.ModuleList([
                 # 这里替换了简单的 nn.Linear
                 SubTaskHead(
-                    in_dim=self.hidden_dim*2,
+                    in_dim=self.hidden_dim * 2,
                     mid_dim=self.mid_hidden_dim,
                     dropout=self.dropout
                 )
                 for _ in range(count)
             ])
             self.sub_heads.append(group_heads)
+        logger.info(f"Build MultitaskClassifier {i // 2 + 1}")
 
     def forward(self, q_t1, q_t2):
         """

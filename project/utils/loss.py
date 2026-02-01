@@ -14,7 +14,6 @@ class BinaryFocalLoss(nn.Module):
             gamma: (float) 聚焦参数
         """
         super().__init__()
-        self.gamma = gamma
         self.reduction = reduction
 
         # 注册 alpha 为 buffer (不作为参数更新，但随模型保存)
@@ -68,13 +67,19 @@ class BinaryFocalLoss(nn.Module):
 
 
 class MultiTaskLoss(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger):
         super().__init__()
         self.cfg = cfg
-        self.loss_type = getattr(cfg.loss, 'type', 'BCE')
+        self.loss_type = getattr(cfg.loss, 'type', 'Focal')
+        logger.info(f"Loss type: {self.loss_type}")
         # [优化] 将 weights 转为 tensor buffer，方便 device 管理
         layer_weights = getattr(cfg.loss, 'layer_weights', [1.0])
+        logger.info(f"Layer weights: {layer_weights}")
         self.register_buffer('layer_weights', torch.tensor(layer_weights, dtype=torch.float32))
+        if len(layer_weights) == 1:
+            logger.info(f"Failed to read layer weight from configuration file,will be created automatically.")
+        else:
+            logger.info(f"Layer weights: {layer_weights}")
 
         # --- 核心：解析任务配置与构建 Loss ---
         # cfg.loss.tasks 是一个字典结构 (DictConfig)
@@ -107,6 +112,7 @@ class MultiTaskLoss(nn.Module):
                 # 获取该任务专属的 alpha
                 alpha = getattr(task_cfg, 'focal_alpha', [0.25] * num_classes)
                 gamma = getattr(cfg.loss, 'focal_gamma', [2.0] * num_classes)  # gamma 通常全局统一
+                logger.info(f"{task_name} focal loss alpha: {alpha}")
 
                 alpha_tensor = torch.tensor(alpha, dtype=torch.float32)
                 gamma_tensor = torch.tensor(gamma, dtype=torch.float32)
@@ -133,7 +139,6 @@ class MultiTaskLoss(nn.Module):
 
         # 1. Targets 统一转 FP32
         targets = targets.float()
-        total_loss = 0.0
 
         # 确保 BCE pos_weight 的 device 正确
         if self.loss_type == 'BCE':
@@ -145,9 +150,18 @@ class MultiTaskLoss(nn.Module):
         layer_keys = sorted(model_outputs.keys(), key=lambda x: int(x.split('_')[1]))
 
         # 动态权重处理
-        if len(self.layer_weights) != len(layer_keys):
-            # fallback
-            weights = [1.0] * len(layer_keys)
+        if self.layer_weights is not None and len(self.layer_weights) != len(layer_keys):
+            # --- 自动生成默认权重策略 ---
+
+            # 策略 A: 线性递增 (推荐作为通用默认)
+            # 逻辑: 第1层权重 1/N, 最后一层 1.0
+            # 示例 (4层): [0.25, 0.5, 0.75, 1.0]
+            weights = [(i + 1) / len(layer_keys) for i in range(len(layer_keys))]
+
+            # 策略 B: 平方递增 (更激进，压制浅层)
+            # 逻辑: 浅层权重更小，强制模型专注于最后一层
+            # 示例 (4层): [0.06, 0.25, 0.56, 1.0]
+            # weights = [((i + 1) / len(layer_keys)) ** 2 for i in range(len(layer_keys))]
         else:
             weights = self.layer_weights
 
@@ -158,12 +172,16 @@ class MultiTaskLoss(nn.Module):
         # Key: "Group/SubID" -> List[float]
         subclass_history = {}
 
+        # [初始化] 累加器
+        total_weighted_loss = 0.0
+        total_valid_weight = 0.0
 
         # --- 双重循环：Layer -> Task ---
         for i, layer_key in enumerate(layer_keys):
             layer_output_dict = model_outputs[layer_key]  # {'road': ..., 'building': ...}
             layer_weight = weights[i]
             layer_total_loss = 0.0  # 该层所有任务的总 Loss
+            layer_count = 0  # [新增] 该层涉及的子任务总数
 
             # 遍历每个任务头 (road, building...)
             for task_name, logits in layer_output_dict.items():
@@ -213,11 +231,20 @@ class MultiTaskLoss(nn.Module):
                 raw_stats[f"{layer_key}/{task_name}/MEAN"] = task_mean
                 # 计算该任务在本层的总 Loss (通常是所有子类求和)
                 layer_total_loss += per_subclass_loss.sum()
+                layer_count += per_subclass_loss.numel()  # 累加子任务数量
 
+            # 计算该层的平均 Loss (Layer Mean)
+            if layer_count > 0:
+                layer_mean = layer_total_loss / layer_count
+                # 1. 累加分子: Mean * Weight
+                total_weighted_loss += layer_mean * weights[i]
+                # 2. 累加分母: Weight (只累加有效层的权重!)
+                total_valid_weight += weights[i]
 
-            # 累加层级 Loss
-            total_loss += layer_weight * layer_total_loss
-            raw_stats[f"{layer_key}/ALL/SUM"] = layer_total_loss.item()
+                # 记录 Log
+                raw_stats[f"{layer_key}/ALL/MEAN"] = layer_mean.item()
+            else:
+                raw_stats[f"{layer_key}/ALL/MEAN"] = 0.0
 
         # 计算 AVG_ALL (跨层平均)
         for hist_key, vals in subclass_history.items():
@@ -237,10 +264,15 @@ class MultiTaskLoss(nn.Module):
                 raw_stats[key.replace("MEAN_list", "MEAN")] = sum(vals) / len(vals)
                 del raw_stats[key]  # 清理临时 list
 
-        raw_stats['TOTAL/ALL/SUM'] = total_loss.item()
+        # --- 最终聚合 ---
+        if total_valid_weight > 0:
+            # 公式: Sum(LayerMean_i * w_i) / Sum(w_i)
+            final_loss = total_weighted_loss / total_valid_weight
+        else:
+            final_loss = torch.tensor(0.0, device=targets.device)
 
-        return total_loss, raw_stats
-
+        raw_stats['TOTAL/ALL/MEAN'] = final_loss.item()
+        return final_loss, raw_stats
 
     @staticmethod
     def format_loss_to_df(loss_stats_list, epoch=None):

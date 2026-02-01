@@ -54,11 +54,11 @@ def svi_collate_fn(batch):
     }
 
 
-def build_dataloader(cfg, split='train'):
+def build_dataloader(cfg, logger, split='train'):
     """
     对外暴露的接口函数
     """
-    dataset = SVIPairsDataset(cfg, split=split)
+    dataset = SVIPairsDataset(cfg, logger, split=split)
 
     shuffle = True if split == 'train' else False
     # 确保 drop_last，避免最后一个 batch 只有一个样本导致 BatchNorm 出错（如果用了 BN）
@@ -74,6 +74,10 @@ def build_dataloader(cfg, split='train'):
         pin_memory=True,
         drop_last=drop_last
     )
+
+    if split == "train":  # 仅在training数据上输出一遍即可
+        logger.info(
+            f"Batch size: {cfg.data.batch_size}, Num workers: {cfg.data.num_workers}")
 
     return loader
 

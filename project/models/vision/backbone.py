@@ -11,7 +11,7 @@ os.environ["FLASH_ATTENTION_VERSION"] = ""
 
 
 class VisionEncoder(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger):
         """
         Args:
             cfg: 全局配置对象 (cfg.model.vision)
@@ -23,8 +23,8 @@ class VisionEncoder(nn.Module):
         self.freeze = cfg.model.vision.freeze_backbone
         # 读取层索引参数，默认为 -1 (即最后一层)
         self.select_layer = getattr(cfg.model.vision, 'select_layer', -1)
-        print(f"Loading Vision Backbone: {model_name} ...")
-        print(f"Selected Layer Index: {self.select_layer}")
+        logger.info(f"Loading Vision Backbone: {model_name} ...")
+        logger.info(f"Selected Layer Index: {self.select_layer}")
 
         self.model = AutoModel.from_pretrained(
             model_name,
@@ -36,16 +36,16 @@ class VisionEncoder(nn.Module):
         )
 
         if self.freeze:
-            print("Frozen Vision Backbone.")
+            logger.info("Frozen Vision Backbone.")
             for param in self.model.parameters():
                 param.requires_grad = False
 
         # 从 cfg 读取维度，或从模型配置读取
-        self.output_dim = self.model.rl_config.hidden_size
+        self.output_dim = self.model.config.hidden_size
 
         # 校验 cfg 中的维度是否与模型一致 (防止写错配置文件)
         if cfg.model.vision.feature_dim != self.output_dim:
-            print(f"[Warning] Config feature_dim ({cfg.model.vision.feature_dim}) "
+            logger.info(f"[Warning] Config feature_dim ({cfg.model.vision.feature_dim}) "
                   f"does not match Model hidden_size ({self.output_dim}). Updating config...")
             # 注意：这里修改的是局部变量，不会回写到 yaml
 
@@ -54,6 +54,7 @@ class VisionEncoder(nn.Module):
         # 在 cfg.model.hidden_dim 中定义，如果没有则默认 4096
         self.target_dim = getattr(cfg.model.vision, 'vision_dim', 4096)
         self.downsample_ratio = getattr(cfg.model.vision, 'downsample_ratio', 0.5)
+        logger.info(f"Downsample ratio{self.downsample_ratio}, Unshuffled vision dim{self.target_dim}")
 
         # 2. 计算 Scale 和 输入通道数
         # 情况 A (ratio=0.5): scale = 2, in_channels = output_dim * 4

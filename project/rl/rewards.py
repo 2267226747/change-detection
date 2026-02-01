@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from utils.loss import RLLoss
+from sklearn.metrics import average_precision_score  # 需要安装 scikit-learn
 
 
 class RewardCalculator:
@@ -76,6 +77,67 @@ class RewardCalculator:
         """
         self.last_cls_loss = None
 
+    def _calc_batch_metrics(self, preds, labels, probs, mask=None):
+        """
+        辅助函数：计算一批数据的 Acc, P, R, F1, AP
+        Args:
+            preds: [N] or [B, T] 0/1 预测
+            labels: [N] or [B, T] 0/1 标签
+            probs: [N] or [B, T] Sigmoid 概率 (用于 AP)
+            mask: [B, T] Bool Mask (可选，如果提供则只计算 Mask 为 True 的部分)
+        Returns:
+            dict: 包含各指标
+        """
+        # 如果提供了 Mask，先筛选数据
+        if mask is not None:
+            # 如果 Mask 为空，返回默认值 0
+            if not mask.any():
+                return {k: 0.0 for k in ['acc', 'precision', 'recall', 'f1', 'ap']}
+
+            flat_preds = preds[mask]
+            flat_labels = labels[mask]
+            flat_probs = probs[mask]
+        else:
+            flat_preds = preds.flatten()
+            flat_labels = labels.flatten()
+            flat_probs = probs.flatten()
+
+        # --- Torch 高效计算基础指标 (避免频繁 CPU 同步) ---
+        # TP, FP, FN, TN
+        tp = (flat_preds * flat_labels).sum().float()
+        tn = ((1 - flat_preds) * (1 - flat_labels)).sum().float()
+        fp = (flat_preds * (1 - flat_labels)).sum().float()
+        fn = ((1 - flat_preds) * flat_labels).sum().float()
+
+        epsilon = 1e-7
+        acc = (tp + tn) / (tp + tn + fp + fn + epsilon)
+        precision = tp / (tp + fp + epsilon)
+        recall = tp / (tp + fn + epsilon)
+        f1 = 2 * (precision * recall) / (precision + recall + epsilon)
+
+        # --- Sklearn 计算 AP (需要 CPU) ---
+        # AP 必须基于概率排序，Torch 实现较麻烦，这里转 CPU 计算
+        # 注意：如果是极大的 Batch，这一步可能会有微小耗时，但在 RL 训练中通常可接受
+        try:
+            # 只有当存在正样本或负样本时 AP 才有意义
+            if len(flat_labels) > 0:
+                y_true = flat_labels.cpu().numpy()
+                y_score = flat_probs.detach().cpu().numpy()
+                # average_precision_score 处理全0或全1标签时比较健壮，通常返回 0 或 1
+                ap = average_precision_score(y_true, y_score)
+            else:
+                ap = 0.0
+        except Exception:
+            ap = 0.0
+
+        return {
+            'acc': acc.item(),
+            'precision': precision.item(),
+            'recall': recall.item(),
+            'f1': f1.item(),
+            'ap': ap
+        }
+
     def compute_reward(self, logits, labels, stop_decision, pre_action_mask, done_mask):
         """
         计算单步奖励
@@ -111,6 +173,7 @@ class RewardCalculator:
         is_forced_stop = pre_action_mask & done_expanded & (stop_decision == 0)
 
         # 3. 预测结果
+        probs = torch.sigmoid(logits)
         preds = (logits > 0).float()
         is_correct = (preds == labels)
         is_positive_label = (labels == 1)
@@ -202,10 +265,20 @@ class RewardCalculator:
             'reward/step_mean': step_rewards.mean().item(),
             'reward/clf_reward_mean': (final_clf_rewards.sum(dim=1) / (is_settling.sum(dim=1) + 1e-6)).mean().item(),
             'reward/shaping_reward_mean': (shaping_rewards.sum(dim=1) / (num_active_pre + 1e-6)).mean().item(),
-            'reward/settled_acc': 0.0
         }
-        if is_settling.any():
-            acc = (preds[is_settling] == labels[is_settling]).float().mean().item()
-            info['reward/settled_acc'] = acc
+
+        # 1. 计算 "Settled" 指标 (仅针对本步结束的任务)
+        # 如果本步没有任务结束，这些值为 0
+        settled_metrics = self._calc_batch_metrics(preds, labels, probs, mask=is_settling)
+        for k, v in settled_metrics.items():
+            info[f'reward/settled_{k}'] = v
+
+        # 2. 计算 "Final/All" 指标 (针对 Batch 内所有任务的当前状态)
+        # 即使任务还在跑，也计算当前的预测性能；如果任务已停，Logits 已锁定。
+        # 这代表了 "如果现在立刻结算整个 Batch" 的性能
+        if done_mask.all():
+            finalall_metrics = self._calc_batch_metrics(preds, labels, probs, mask=None)  # mask=None 表示取全部
+            for k, v in finalall_metrics.items():
+                info[f'reward/finalall_{k}'] = v
 
         return step_rewards, info

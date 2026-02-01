@@ -181,14 +181,14 @@ class Evaluator:
         # 排序: Layer (numeric sort logic needed but string sort ok for few layers) -> Group -> SubID
         # 先按层数(数字)排，再按组排
         # 提取层号辅助排序
-        def get_layer_num(s):
-            if 'layer_' in s: return int(s.split('_')[1])
-            if s == 'AVG_ALL': return 9999
-            return -1
-
-        df_final['LayerNum'] = df_final['Layer'].apply(get_layer_num)
-        df_final = df_final.sort_values(by=['LayerNum', 'Group', 'SubID'])
-        df_final = df_final.drop(columns=['LayerNum'])  # 删掉辅助列
+        # def get_layer_num(s):
+        #     if 'layer_' in s: return int(s.split('_')[1])
+        #     if s == 'AVG_ALL': return 9999
+        #     return -1
+        #
+        # df_final['LayerNum'] = df_final['Layer'].apply(get_layer_num)
+        # df_final = df_final.sort_values(by=['LayerNum', 'Group', 'SubID'])
+        # df_final = df_final.drop(columns=['LayerNum'])  # 删掉辅助列
 
         # 插入 Epoch 列
         if epoch is not None:

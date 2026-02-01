@@ -21,9 +21,19 @@ class PPOAgent(nn.Module):
         self.classifier_heads = classifier_heads
         self.rl_config = config.rl
 
-        # 将分类头参数加入优化器
-        # 注意：这里我们将 agent 参数和 classifier 参数合并管理
-        all_params = list(self.network.parameters()) + classifier_params
+        # 获取是否冻结分类器的配置
+        self.freeze_classifier = getattr(config, 'freeze_classifier', False)
+
+        # 1. 构建优化器参数列表
+        # 如果冻结分类器，只优化 Policy/Value 网络 (network)
+        # 如果不冻结，同时优化 Policy/Value 网络 和 分类头 (classifier_params)
+        if self.freeze_classifier:
+            print("PPOAgent: Classifier is FROZEN. Only optimizing RL Policy/Value network.")
+            all_params = list(self.network.parameters())
+        else:
+            print("PPOAgent: Classifier is TRAINABLE. Optimizing Jointly.")
+            all_params = list(self.network.parameters()) + classifier_params
+            self.cls_criterion = RLLoss(config).to(self.device)
 
         # 优化器
         self.optimizer = torch.optim.AdamW(
@@ -33,7 +43,6 @@ class PPOAgent(nn.Module):
             weight_decay=self.rl_config.weight_decay
         )
 
-        self.cls_criterion = RLLoss(config).to(self.device)
 
     def get_action(self, obs, deterministic=False):
         """
@@ -168,7 +177,8 @@ class PPOAgent(nn.Module):
         # ====================================================
         cls_loss = torch.tensor(0.0, device=self.network.parameters().__next__().device)
 
-        if len(self.classifier_heads) > 0:
+        # [修改] 只有在未冻结分类器 且 有分类头 的情况下才计算
+        if (not self.freeze_classifier) and (len(self.classifier_heads) > 0):
             # 我们需要重算 Logits 以获取梯度。
             # 问题：Buffer 中的 Obs 混合了不同 Step 的数据。
             # 解决：利用 obs['time'] 反推 Step Index，分批处理。

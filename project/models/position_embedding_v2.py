@@ -63,7 +63,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 class PositionalEmbedder2(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger):
         """
         Args:
             cfg: 全局配置对象 (cfg.data)

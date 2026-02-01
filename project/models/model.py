@@ -8,26 +8,27 @@ from models.heads.multitask_head import MultitaskClassifier
 
 
 class AssembledFusionModel(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger):
         super().__init__()
         # 保留原始 cfg 引用，以防子模块需要访问不同层级的配置
         self.full_cfg = cfg
         self.model_cfg = cfg.model.assembled_model
 
         # 1. Vision Encoder
-        self.vision_encoder = VisionEncoder(cfg)
+        self.vision_encoder = VisionEncoder(self.full_cfg, logger)
 
         # 2. Positional Embedder
-        self.pos_embedder = PositionalEmbedder2(cfg)
+        self.pos_embedder = PositionalEmbedder2(self.full_cfg, logger)
 
         # 3. Query Generator
-        self.query_generator = QueryGenerator(cfg)
+        self.query_generator = QueryGenerator(self.full_cfg, logger)
 
         # 4. Transformer Blocks & 5. Class Heads
         # 获取总层数，默认为 12
-        self.num_layers = getattr(cfg, 'num_layers', 24)
-        self.start_classify = getattr(cfg, 'start_classify', 1)
+        self.num_layers = getattr(self.model_cfg, 'num_layers', 24)
+        self.start_classify = getattr(self.model_cfg, 'start_classify', 1)
         self.reasoning_stage_count = 0
+        logger.info(f"Num layers: {self.num_layers},Start classify: {self.start_classify}")
 
         self.transformer_blocks = nn.ModuleList()
         self.class_heads = nn.ModuleList()
@@ -41,7 +42,7 @@ class AssembledFusionModel(nn.Module):
 
             # 添加 Transformer Block
             # 注意：FusionTransformerBlock2 的 if_query 参数含义是 "是否进行 Query-Image 交互"
-            block = FusionTransformerBlock2(cfg, if_query=is_sensing_layer )
+            block = FusionTransformerBlock2(self.full_cfg, i, logger, if_query=is_sensing_layer)
             self.transformer_blocks.append(block)
 
             # 如果是 Reasoning 层，则挂载一个分类头
@@ -53,7 +54,7 @@ class AssembledFusionModel(nn.Module):
                 # 例如 start=1，则第1、2、3...个 reasoning layer 都有头 (Deep Supervision)
                 # 如果只想在最后一层加，可以在这里改逻辑
                 if self.reasoning_stage_count >= self.start_classify:
-                    head = MultitaskClassifier(cfg)
+                    head = MultitaskClassifier(self.full_cfg, i, logger)
                     self.class_heads.append(head)
 
     def _process_visual_sequence(self, pixel_values, batch_size, patches_num):
@@ -122,10 +123,13 @@ class AssembledFusionModel(nn.Module):
             is_sensing_layer = (i % 2 == 0)
 
             if is_sensing_layer:
+
+                layer_pos = self.query_generator.get_layer_pos(i // 2 , current_bs)
                 # 执行 Transformer Block sensing 层，query vision feature
                 q_t1, q_t2 = block(
                     q_t1=q_t1,
                     q_t2=q_t2,
+                    layer_pos=layer_pos,
                     vision_1=vision_1_feat,
                     vision_2=vision_2_feat,
                     vision_pos1=vision_pos1,
@@ -139,15 +143,14 @@ class AssembledFusionModel(nn.Module):
                     q_t2=q_t2,
                 )
 
-                if (i+1) / 2 >= self.start_classify:
+                if (i + 1) / 2 >= self.start_classify:
                     # 获取对应的 Head
                     current_head = self.class_heads[head_idx]
                     # 计算分类结果
                     layer_results = current_head(q_t1, q_t2)
                     # 存入结果字典，Key 建议带上层号以便区分
-                    all_results[f'ClassifyLayer_{head_idx+1}'] = layer_results
+                    all_results[f'ClassifyLayer_{head_idx + 1}'] = layer_results
                     # Head 索引递增
                     head_idx += 1
-
 
         return all_results

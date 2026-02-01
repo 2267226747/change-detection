@@ -5,7 +5,7 @@ from models.transformer.flashattention import FlashAttention
 
 
 class FusionTransformerBlock2(nn.Module):
-    def __init__(self, cfg, if_query=True):
+    def __init__(self, cfg, i, logger, if_query=True):
         """
         Args:
             cfg: 全局配置对象 (cfg.model.transformer_block)
@@ -30,6 +30,17 @@ class FusionTransformerBlock2(nn.Module):
         self.if_k_pos = getattr(block_cfg, 'if_k_position', True)
         self.if_v_pos = getattr(block_cfg, 'if_v_position', False)
 
+        if i == 0:
+            logger.info(
+                f"Query token dim={self.q_dim}, "
+                f"Num heads={self.num_heads}, "
+                f"mlp ratio={self.mlp_ratio}, "
+                f"if_q_pos: {self.if_q_pos}, " 
+                f"if_k_pos: {self.if_k_pos}, "
+                f"if_v_pos: {self.if_v_pos} "
+
+            )
+
         # 2. 动态选择组件
         norm_layer_name = getattr(block_cfg, 'norm_layer', "LayerNorm")
         norm_map = {"LayerNorm": nn.LayerNorm, "RMSNorm": RMSNorm}
@@ -39,8 +50,8 @@ class FusionTransformerBlock2(nn.Module):
         act_map = {"GELU": nn.GELU, "ReLU": nn.ReLU, "SiLU": nn.SiLU}
         ActLayer = act_map.get(act_layer_name, nn.GELU)
 
-        print(
-            f"Build Block with: Norm={NormLayer.__name__}, "
+        logger.info(
+            f"Build Block{i+1} with: Norm={NormLayer.__name__}, "
             f"QKNorm={self.use_qk_norm}, "
             f"ActLayer={ActLayer.__name__}, "
             f"if_query={if_query}, "
@@ -112,7 +123,7 @@ class FusionTransformerBlock2(nn.Module):
 
         self.dropout_layer = nn.Dropout(self.dropout)
 
-    def forward(self, q_t1, q_t2, vision_1=None, vision_2=None, vision_pos1=None, vision_pos2=None):
+    def forward(self, q_t1, q_t2, layer_pos=None, vision_1=None, vision_2=None, vision_pos1=None, vision_pos2=None):
         """
         分别输入两组 Query 和 Vision Features 及 位置编码
         q1, q2: [B, L, D]
@@ -123,7 +134,7 @@ class FusionTransformerBlock2(nn.Module):
 
         # 1. Siamese Cross-Attention (分别交互)
         if self.if_query:
-            # print("query")
+
             assert vision_1 is not None and vision_2 is not None, "if_cross=True but Vision features missing"
             # 准备 Key 和 Value
             # 默认 Key/Value 就是 vision_t，根据 flag 叠加位置编码
@@ -131,6 +142,9 @@ class FusionTransformerBlock2(nn.Module):
             k2, v2 = vision_2, vision_2
 
             # 统一处理位置编码逻辑
+            q_t1 = q_t1 + layer_pos
+            q_t2 = q_t2 + layer_pos
+
             if self.if_k_pos or self.if_v_pos:
                 assert vision_pos1 is not None and vision_pos2 is not None, "Pos embedding enabled but input is None"
                 if self.if_k_pos:
@@ -204,7 +218,6 @@ class FusionTransformerBlock2(nn.Module):
         return q_t1, q_t2
 
 
-
 def print_model_statistics(model):
     print(f"\n{'=' * 20} Model Parameter Statistics {'=' * 20}")
     print(f"{'Module Name':<25} | {'Total Params':<15} | {'Trainable':<10}")
@@ -243,6 +256,8 @@ def print_model_statistics(model):
 # =================================================================
 if __name__ == "__main__":
     from utils.config import Config  # 假设存在
+
+
     # 模拟 Config 类
     class MockConfig:
         class model:
@@ -269,10 +284,6 @@ if __name__ == "__main__":
     # 初始化模型
     model_block = FusionTransformerBlock2(cfg, if_query=True).to(device)
     print_model_statistics(model_block)
-
-
-
-
 
     # # 创建数据
     # B, L, D_q, D_v = 2, 10, 128, 256

@@ -6,15 +6,15 @@
 data:
   image_patches_size: 448      #将图片分割成大子块的大小
   patch_size: 14               #子块再次分割的大小
-  batch_size: 2
+  batch_size: 4
   patches_h_num: 3             #大子块的行数
   patches_w_num: 9             #打字快的列数
   patches_min_num: 1           #最小子块数量
   patches_max_num: 128         #最大子块数量
   patches_num: 28              #所有子块的数量，包括缩略图   patches_h_num * patches_w_num + 1
   use_thumbnail: True
-  vision_dim: 2048             # vision token经过unshuffle后的维度
-  num_workers: 8
+  vision_dim: 1024             # vision token经过unshuffle后的维度
+  num_workers: 16
 
   # 数据根目录 (根据你的实际路径修改)
   train_image_dir: "/root/autodl-tmp/data/SVI image(panorama)_Wuhan"
@@ -47,7 +47,6 @@ model:
 
   # Assembled Model
   assembled_model:
-    max_timesteps: 5              # 最大时间步 T_max
     num_layers: 18                # T_t 堆叠层数
     start_classify: 1              # 开始挂载分类头的位置     start_classfy*2，因为只在reasoning层进行分类
 
@@ -58,26 +57,26 @@ model:
     feature_dim: 1024            # InternViT vision token 原始输出维度
     freeze_backbone: Ture        # 是否冻结视觉部分参数
     select_layer: -1           # [新增] 选择倒数第几层的输出 (官方建议 -4)
-    vision_dim: 2048             # vision token经过unshuffle后的维度
+    vision_dim: 1024             # vision token经过unshuffle后的维度
 
   # query token
   query_token:
-    total_tokens: 1024
+    total_tokens: 512
     task_nums: 4
-    tokens_per_task: 256
-    dim: 1024
-    batch_size: 2
+    tokens_per_task: 128
+    query_dim: 1024
+    batch_size: 4
 
   # 时序 Transformer (Temporal Transformer)
   transformer_block:
     query_dim: 1024                  # Query token的维度 (也是block的主干维度)
-    vision_dim: 2048                 # vision token经过unshuffle后的维度
+    vision_dim: 1024                 # vision token经过unshuffle后的维度
     num_head: 16                     # 多头注意力头数
     mlp_ratio: 4.0                   # FNN hidden_dim = mlp_ratio*query_dim
     dropout: 0.1
     use_qk_norm: True
     if_q_position: False
-    if_k_position: False
+    if_k_position: True
     if_v_position: False
     norm_layer: "RMSNorm"
     act_layer: "GELU"
@@ -101,8 +100,8 @@ model:
 # -------------------------
 loss:
   # 选择 loss 类型
-  type: 'BCE'       # 或 'Focal'
-  layer_weights: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]   # Deep Supervision 层级权重 (9个 Reasoning 层)
+  type: 'Focal'       # 或 'Focal'
+  layer_weights: [0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.6, 0.8, 1.0]   # Deep Supervision 层级权重 (9个 Reasoning 层)
 
   # --- 任务定义与权重配置 ---
   # 这里的顺序必须与 Dataset 中 label 拼接的顺序一致！
@@ -119,7 +118,7 @@ loss:
     building:
       num_classes: 8
       pos_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # 假设比较平衡
-      focal_alpha: [0.6608, 0.8458, 0.7445, 0.5374, 0.9824, 0.9824, 0.7357, 0.7269]
+      focal_alpha: [0.6608, 0.8458, 0.7445, 0.5374, 0.9, 0.9, 0.7357, 0.7269]
       focal_gamma: [2.322, 2.692, 2.489, 2.075, 2.965, 2.965, 2.471, 2.454]
 
     greenery:
@@ -131,7 +130,7 @@ loss:
     infrastructure:
       num_classes: 8
       pos_weight: [1.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0]
-      focal_alpha: [0.9427, 0.8282, 0.7048, 0.978, 0.9163, 0.7313, 0.9604, 0.9736]
+      focal_alpha: [0.9, 0.8282, 0.7048, 0.9, 0.9163, 0.7313, 0.9, 0.9]
       focal_gamma: [2.885, 2.656, 2.41, 2.956, 2.833, 2.463, 2.921, 2.947]
 
 
@@ -153,7 +152,7 @@ train:
 # 5. 强化学习 (RL - Step 2)
 # -------------------------
 rl:
-  query_dim: 1024
-  tokens_per_task: 256
-  vision_dim: 2048
-  hidden_dim:
+  pre_model_path: "./model/project/results/checkpoints/model_best.pth"
+  device: "cuda"
+  freeze_classifier: "False"
+  hidden_dim: 512 # Env 返回的 Dict Obs 编码为统一的 Hidden State 的 dim
