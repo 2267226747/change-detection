@@ -18,6 +18,17 @@ class RLEnv:
         self.freeze_classifier = self.config.rl.freeze_classifier
         logger.info(f"Freeze classifier: {self.freeze_classifier}")
 
+
+        # 1. 获取混合精度配置
+        # 建议在 config 中添加该字段，默认 False
+        self.use_amp = getattr(self.config.rl, 'use_amp', True)
+        self.dtype = torch.float16 if self.use_amp else torch.float32
+        
+        # 确定设备类型供 autocast 使用 ('cuda' or 'cpu')
+        self.device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
+        
+        logger.info(f"RLEnv Mixed Precision (AMP) Enabled: {self.use_amp}")
+
         # ====================================================
         # 1. 冻结策略管理
         # ====================================================
@@ -101,50 +112,55 @@ class RLEnv:
         初始化环境，并执行 RL 介入前的所有前置计算 (Pre-rollout)
         对应 Forward 的 A, B, C 阶段
         """
-        pixel_values_1 = batch_data['pixel_values_1'].to(self.device)
-        pixel_values_2 = batch_data['pixel_values_2'].to(self.device)
+        pixel_values_1 = batch_data['pixel_values_t1'].to(self.device)
+        pixel_values_2 = batch_data['pixel_values_t2'].to(self.device)
         self.current_labels = batch_data.get('labels', None)
 
         # 动态 Batch Size
         self.batch_size = pixel_values_1.shape[0] // self.patches_num
 
-        with torch.no_grad():
-            # --- A. 视觉特征提取 ---
-            # 直接调用模型内部的辅助函数
-            self.vision_1_feat = self.model._process_visual_sequence(
-                pixel_values_1, self.batch_size, self.patches_num
-            )
-            self.vision_2_feat = self.model._process_visual_sequence(
-                pixel_values_2, self.batch_size, self.patches_num
-            )
-            target_dtype = self.vision_1_feat.dtype
-
-            # --- B. 位置编码 ---
-            self.vision_pos1 = self.model.pos_embedder(self.batch_size, image_time=0).to(target_dtype)
-            self.vision_pos2 = self.model.pos_embedder(self.batch_size, image_time=1).to(target_dtype)
-
-            # --- C. Query 初始化 ---
-            self.q_t1 = self.model.query_generator(self.batch_size).to(target_dtype)
-            self.q_t2 = self.model.query_generator(self.batch_size).to(target_dtype)
-
-            # --- Pre-rollout (关键) ---
-            # 如果 start_classify > 1，RL 介入前的 transformer 层需要先跑完
-            # start_classify=1 (default): range(0) -> 不跑，直接进入 step 0
-            # start_classify=2: range(1) -> 跑完第1阶段(Block 0,1)，准备进入 step 0 (即第2阶段)
-            for stage_i in range(self.start_classify - 1):
-                sensing_idx = stage_i * 2
-                reasoning_idx = stage_i * 2 + 1
-
-                # Sensing
-                self.q_t1, self.q_t2 = self.model.transformer_blocks[sensing_idx](
-                    q_t1=self.q_t1, q_t2=self.q_t2,
-                    vision_1=self.vision_1_feat, vision_2=self.vision_2_feat,
-                    vision_pos1=self.vision_pos1, vision_pos2=self.vision_pos2
+        # [NEW] 2. 开启 Autocast
+        # 视觉骨干和 Transformer 的计算量最大，必须包裹
+        with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
+            with torch.no_grad():
+                # --- A. 视觉特征提取 ---
+                # 直接调用模型内部的辅助函数
+                self.vision_1_feat = self.model._process_visual_sequence(
+                    pixel_values_1, self.batch_size, self.patches_num
                 )
-                # Reasoning
-                self.q_t1, self.q_t2 = self.model.transformer_blocks[reasoning_idx](
-                    q_t1=self.q_t1, q_t2=self.q_t2
+                self.vision_2_feat = self.model._process_visual_sequence(
+                    pixel_values_2, self.batch_size, self.patches_num
                 )
+                target_dtype = self.vision_1_feat.dtype
+
+                # --- B. 位置编码 ---
+                self.vision_pos1 = self.model.pos_embedder(self.batch_size, image_time=0).to(target_dtype)
+                self.vision_pos2 = self.model.pos_embedder(self.batch_size, image_time=1).to(target_dtype)
+
+                # --- C. Query 初始化 ---
+                self.q_t1 = self.model.query_generator(self.batch_size).to(target_dtype)
+                self.q_t2 = self.model.query_generator(self.batch_size).to(target_dtype)
+
+                # --- Pre-rollout (关键) ---
+                # 如果 start_classify > 1，RL 介入前的 transformer 层需要先跑完
+                # start_classify=1 (default): range(0) -> 不跑，直接进入 step 0
+                # start_classify=2: range(1) -> 跑完第1阶段(Block 0,1)，准备进入 step 0 (即第2阶段)
+                for stage_i in range(self.start_classify - 1):
+                    sensing_idx = stage_i * 2
+                    reasoning_idx = stage_i * 2 + 1
+
+                    # Sensing
+                    layer_pos = self.model.query_generator.get_layer_pos(sensing_idx // 2, self.batch_size)
+                    self.q_t1, self.q_t2 = self.model.transformer_blocks[sensing_idx](
+                        q_t1=self.q_t1, q_t2=self.q_t2,
+                        layer_pos=layer_pos,
+                        vision_1=self.vision_1_feat, vision_2=self.vision_2_feat,
+                        vision_pos1=self.vision_pos1, vision_pos2=self.vision_pos2
+                    )
+                    # Reasoning
+                    self.q_t1, self.q_t2 = self.model.transformer_blocks[reasoning_idx](
+                        q_t1=self.q_t1, q_t2=self.q_t2
+                    )
 
         # 重置计数器
         self.current_step = 0
@@ -156,7 +172,7 @@ class RLEnv:
         )
         self.final_logits = torch.zeros(
             (self.batch_size, self.total_subtasks),
-            device=self.device
+            dtype=torch.float32, device=self.device
         )
 
         return self._get_observation()
@@ -225,17 +241,19 @@ class RLEnv:
             s_indices = self.group_indices[g_idx]  # len = sub_counts[g]
             group_active_mask[:, g_idx] = self.subtask_active_mask[:, s_indices].any(dim=1)  # [B, sub_counts[g]] → [B]
 
+        tokens_per_group = self.q_t1.shape[1] // self.num_groups  # q_t1: [B, N, D],  N = G * tokens_per_group
+
+        # group_active_mask: [B, G]  扩展 Mask: [B, G] -> [B, N]
+        token_active_mask = group_active_mask.repeat_interleave(tokens_per_group, dim=1).unsqueeze(-1)
+
         # ====================================================
         # 2. 应用 Query 修正 (仅 Active 的 Group 生效) (Broadcast & Mask)
         # ====================================================
-        tokens_per_group = self.q_t1.shape[1] // self.num_groups  # q_t1: [B, N, D],  N = G * tokens_per_group
         # 广播group_correction: [B, G, D] -> [B, N, D]
         correction_expanded = group_correction.unsqueeze(2).repeat(1, 1, tokens_per_group,
                                                                    1)  # [B, G, 1, D] → [B, G, tokens_per_group, D]
         # → [B, N, D]
         correction_flat = correction_expanded.reshape(self.batch_size, -1, group_correction.shape[-1])
-        # group_active_mask: [B, G]  扩展 Mask: [B, G] -> [B, N, 1]
-        token_active_mask = group_active_mask.repeat_interleave(tokens_per_group, dim=1).unsqueeze(-1)
 
         # 修正 Query
         self.q_t1 = self.q_t1 + (correction_flat * token_active_mask.float())
@@ -255,25 +273,29 @@ class RLEnv:
         block_reasoning = self.model.transformer_blocks[reasoning_idx]
         current_head = self.model.class_heads[self.current_step]
 
-        with torch.no_grad():
-            # Sensing Layer
-            q_t1_next, q_t2_next = block_sensing(
-                q_t1=self.q_t1, q_t2=self.q_t2,
-                vision_1=self.vision_1_feat, vision_2=self.vision_2_feat,
-                vision_pos1=self.vision_pos1, vision_pos2=self.vision_pos2
-            )
-            # Reasoning Layer
-            q_t1_next, q_t2_next = block_reasoning(
-                q_t1=q_t1_next, q_t2=q_t2_next
-            )
+        # 开启 Autocast 进行重计算
+        with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
+            with torch.no_grad():
+                # Sensing Layer
+                layer_pos = self.model.query_generator.get_layer_pos(sensing_idx // 2, self.batch_size)
+                q_t1_next, q_t2_next = block_sensing(
+                    q_t1=self.q_t1, q_t2=self.q_t2,
+                    layer_pos=layer_pos,
+                    vision_1=self.vision_1_feat, vision_2=self.vision_2_feat,
+                    vision_pos1=self.vision_pos1, vision_pos2=self.vision_pos2
+                )
+                # Reasoning Layer
+                q_t1_next, q_t2_next = block_reasoning(
+                    q_t1=q_t1_next, q_t2=q_t2_next
+                )
 
-            # 模拟 Early Exit：只更新 active 的部分，token级别，但是在一个group内是一致的
-            # 4. 执行分类头 (MultitaskClassifier)
-            # Forward
-            logits_dict = current_head(q_t1_next, q_t2_next)
+                # 模拟 Early Exit：只更新 active 的部分，token级别，但是在一个group内是一致的
+                # 4. 执行分类头 (MultitaskClassifier)
+                # Forward
+                logits_dict = current_head(q_t1_next, q_t2_next)
 
         # Flatten
-        current_logits_flat = self._flatten_logits(logits_dict)
+        current_logits_flat = self._flatten_logits(logits_dict).float()
 
         # 更新结果 (Result Locking)
         self.final_logits = torch.where(
@@ -295,9 +317,9 @@ class RLEnv:
         info = {
             'step': self.current_step,
             'active_mask': self.subtask_active_mask,
-            'pre_action_mask': pre_subtask_active_mask,  # [新增] 这是给 Reward 计算用的旧 mask
+            'pre_action_mask': pre_subtask_active_mask,  # 这是给 Reward 计算用的旧 mask
             'labels': self.current_labels,
-            # [新增] 显式传出分类头使用的输入
+            # 显式传出分类头使用的输入
             'cls_input_q': torch.cat([self.q_t1, self.q_t2], dim=-1)
         }
 

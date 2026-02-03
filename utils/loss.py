@@ -70,16 +70,15 @@ class MultiTaskLoss(nn.Module):
     def __init__(self, cfg, logger):
         super().__init__()
         self.cfg = cfg
+        self.logger = logger
         self.loss_type = getattr(cfg.loss, 'type', 'Focal')
-        logger.info(f"Loss type: {self.loss_type}")
+        self.logger.info(f"Loss type: {self.loss_type}")
         # [优化] 将 weights 转为 tensor buffer，方便 device 管理
-        layer_weights = getattr(cfg.loss, 'layer_weights', [1.0])
-        logger.info(f"Layer weights: {layer_weights}")
-        self.register_buffer('layer_weights', torch.tensor(layer_weights, dtype=torch.float32))
-        if len(layer_weights) == 1:
-            logger.info(f"Failed to read layer weight from configuration file,will be created automatically.")
+        self.layer_weights = torch.tensor(getattr(cfg.loss, 'layer_weights', [1.0]), dtype=torch.float32)
+        if len(self.layer_weights) == 1:
+            self.logger.info(f"Failed to read layer weight from configuration file,will be created automatically.")
         else:
-            logger.info(f"Layer weights: {layer_weights}")
+            self.logger.info(f"Layer weights: {self.layer_weights}")
 
         # --- 核心：解析任务配置与构建 Loss ---
         # cfg.loss.tasks 是一个字典结构 (DictConfig)
@@ -112,7 +111,7 @@ class MultiTaskLoss(nn.Module):
                 # 获取该任务专属的 alpha
                 alpha = getattr(task_cfg, 'focal_alpha', [0.25] * num_classes)
                 gamma = getattr(cfg.loss, 'focal_gamma', [2.0] * num_classes)  # gamma 通常全局统一
-                logger.info(f"{task_name} focal loss alpha: {alpha}")
+                self.logger.info(f"{task_name} focal loss alpha: {alpha}")
 
                 alpha_tensor = torch.tensor(alpha, dtype=torch.float32)
                 gamma_tensor = torch.tensor(gamma, dtype=torch.float32)
@@ -156,14 +155,16 @@ class MultiTaskLoss(nn.Module):
             # 策略 A: 线性递增 (推荐作为通用默认)
             # 逻辑: 第1层权重 1/N, 最后一层 1.0
             # 示例 (4层): [0.25, 0.5, 0.75, 1.0]
-            weights = [(i + 1) / len(layer_keys) for i in range(len(layer_keys))]
+            self.layer_weights = [(i + 1) / len(layer_keys) for i in range(len(layer_keys))]
 
             # 策略 B: 平方递增 (更激进，压制浅层)
             # 逻辑: 浅层权重更小，强制模型专注于最后一层
             # 示例 (4层): [0.06, 0.25, 0.56, 1.0]
             # weights = [((i + 1) / len(layer_keys)) ** 2 for i in range(len(layer_keys))]
+
+            self.logger.info(f"Layer weights: {self.layer_weights}")
         else:
-            weights = self.layer_weights
+            pass
 
         # 用于存储原始数值的字典，结构扁平化以便快速累加
         # Key: "Layer/Group/SubID" -> Value: float
@@ -179,7 +180,6 @@ class MultiTaskLoss(nn.Module):
         # --- 双重循环：Layer -> Task ---
         for i, layer_key in enumerate(layer_keys):
             layer_output_dict = model_outputs[layer_key]  # {'road': ..., 'building': ...}
-            layer_weight = weights[i]
             layer_total_loss = 0.0  # 该层所有任务的总 Loss
             layer_count = 0  # [新增] 该层涉及的子任务总数
 
@@ -237,9 +237,9 @@ class MultiTaskLoss(nn.Module):
             if layer_count > 0:
                 layer_mean = layer_total_loss / layer_count
                 # 1. 累加分子: Mean * Weight
-                total_weighted_loss += layer_mean * weights[i]
+                total_weighted_loss += layer_mean * self.layer_weights[i]
                 # 2. 累加分母: Weight (只累加有效层的权重!)
-                total_valid_weight += weights[i]
+                total_valid_weight += self.layer_weights[i]
 
                 # 记录 Log
                 raw_stats[f"{layer_key}/ALL/MEAN"] = layer_mean.item()
@@ -327,12 +327,18 @@ class MultiTaskLoss(nn.Module):
 
 
 class RLLoss(MultiTaskLoss):
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger=None):
         """
         RL 专用的 Loss 计算器。
         继承自 MultiTaskLoss 以复用配置解析和 Loss 准则构建逻辑。
         """
-        super().__init__(cfg)
+        super().__init__(cfg, logger=logger)
+
+        self.layer_weights = torch.tensor(getattr(cfg.rl, 'layer_weights', [1.0]), dtype=torch.float32)
+        if len(self.layer_weights) == 1:
+            self.logger.info(f"Failed to read layer weight from configuration file,will be created automatically.")
+        else:
+            self.logger.info(f"Layer weights: {self.layer_weights}")
 
         # 预先计算每个 Group 在展平 Logits 中的切片索引
         # 假设 Logits 是按照 self.tasks 中定义的顺序拼接的

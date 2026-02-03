@@ -4,6 +4,10 @@ import os
 from types import SimpleNamespace
 import yaml
 import sys
+
+# 获取项目根目录路径
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
 from utils.logger import setup_logger
 
 # 引入你的 RL 模块
@@ -14,9 +18,6 @@ from rl.buffer import RolloutBuffer
 from rl.rewards import RewardCalculator
 from trainer.rl_trainer import PPOTrainer
 
-# 获取项目根目录路径
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
 from utils.config import Config
 
 # 预训练模型定义
@@ -75,6 +76,23 @@ def get_config():
 
     return config
 
+def load_pretrained_model(model, ckpt_path, strict=True):
+    """
+    加载预训练模型权重（从标准 checkpoint 格式）
+    """
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    
+    # 安全加载（PyTorch ≥2.4 推荐 weights_only=False 仅用于可信来源）
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    
+    if 'state_dict' not in checkpoint:
+        raise KeyError("Checkpoint must contain 'state_dict' key")
+    
+    model.load_state_dict(checkpoint['state_dict'], strict=strict)
+    print(f"✅ Loaded pretrained weights from {ckpt_path}")
+    return model
+
 
 def main():
     # 1. 加载配置
@@ -86,13 +104,14 @@ def main():
 
     # 2. 准备数据
     logger.info("Loading data...")
+    cfg.data.batch_size = cfg.rl.batch_size
     train_loader = build_dataloader(cfg, logger, split='train')
     val_loader = build_dataloader(cfg, logger, split='val')
 
     # 3. 加载预训练模型 (Mockup)
     logger.info("Loading pretrained model...")
     pretrained_model = AssembledFusionModel(cfg, logger)
-    pretrained_model.load_state_dict(torch.load(cfg.rl.pre_model_path))
+    pretrained_model = load_pretrained_model(pretrained_model, cfg.rl.pre_model_path)
     pretrained_model.to(cfg.rl.device)
 
     # 4. 实例化环境
@@ -120,35 +139,42 @@ def main():
                 f"Tokens per group(Query): {env_shapes['tokens_per_group']}")
 
     # 6. 实例化 Actor-Critic Network
-    network = ActorCriticNetwork(cfg, env_shapes, logger).to(cfg.device)
+    network = ActorCriticNetwork(config=cfg, env_shapes=env_shapes, logger=logger).to(cfg.rl.device)
 
     # 7. 实例化 Agent
+    logger.info("Initializing Agent...")
     # [关键] 传入分类头引用和参数，实现联合优化
     agent = PPOAgent(
         network=network,
         classifier_heads=env.model.class_heads,
         classifier_params=env.get_classifier_parameters(),
-        config=cfg
-    ).to(rl_cfg.device)
+        config=cfg,
+        logger=logger
+    ).to(cfg.rl.device)
 
     # 8. 实例化辅助组件
+    logger.info("Initializing Buffer...")
     # Buffer: 注意 buffer_size = num_steps * env_batch_size
     # 这里 env_batch_size 是隐式的 (由 train_loader 的 batch_size 决定)
     # 我们可以等到 reset 后获取，或者在 config 里硬编码 rl_batch_size
-    buffer = RolloutBuffer(rl_cfg, device=rl_cfg.device)
+    buffer = RolloutBuffer(config=cfg, device=cfg.rl.device, logger=logger)
 
     # Reward Calculator: 需要传入 Group Names 以保证权重顺序对齐
+    logger.info("Initializing Reward...")
     # 假设 cfg 里有 reward_config
-    reward_calc = RewardCalculator(cfg, env_group_names=env.group_names)
+    reward_calc = RewardCalculator(config=cfg, env_group_names=env.group_names, logger=logger)
 
     # 9. 实例化 Trainer
+    logger.info("Initializing Trainer...")
     trainer = PPOTrainer(
-        config=rl_cfg,
+        config=cfg,
         agent=agent,
         env=env,
         buffer=buffer,
         reward_calculator=reward_calc,
-        train_loader=train_loader
+        train_loader=train_loader,
+        val_loader=val_loader,
+        logger=logger
     )
 
     # 10. 开始训练

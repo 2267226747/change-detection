@@ -14,6 +14,12 @@ class MultiModalFeatureExtractor(nn.Module):
         self.tokens_per_group = env_shapes['tokens_per_group']
         hidden_dim = config.rl.hidden_dim
 
+
+        # [AMP Config]
+        self.use_amp = getattr(config.rl, 'use_amp', True)                 
+        # 自动判断设备类型
+        self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+
         # 1. Query Encoder (处理主要状态)
         # 输入: [B, N, 2D] -> 聚合为 [B, G, 2D] -> MLP -> [B, G, H]
         query_input_dim = env_shapes['query_dim'] * 2
@@ -56,37 +62,43 @@ class MultiModalFeatureExtractor(nn.Module):
             fused_feat: [B, Groups, Hidden] 保留 Group 维度用于 Correction 动作
             flat_feat:  [B, Groups * Hidden] 展平特征用于 Stop 动作和 Value
         """
-        # A. Query 处理: [B, N, 2D] -> [B, G, TPG, 2D] -> Mean -> [B, G, 2D]
-        B = obs['query_state'].shape[0]
-        q_grouped = obs['query_state'].view(B, self.num_groups, self.tokens_per_group, -1)
-        q_pooled = q_grouped.mean(dim=2)
-        q_embed = self.query_mlp(q_pooled)  # [B, G, H]
+        # [AMP] 开启 Autocast
+        with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
+            # A. Query 处理: [B, N, 2D] -> [B, G, TPG, 2D] -> Mean -> [B, G, 2D]
+            B = obs['query_state'].shape[0]
+            q_grouped = obs['query_state'].view(B, self.num_groups, self.tokens_per_group, -1)
+            q_pooled = q_grouped.mean(dim=2)
+            q_embed = self.query_mlp(q_pooled)  # [B, G, H]
 
-        # B. Vision 处理: [B, D] -> [B, H] -> Broadcast -> [B, G, H]
-        v_embed = self.vision_mlp(obs['vision_context'])
-        v_embed = v_embed.unsqueeze(1).expand(-1, self.num_groups, -1)
+            # B. Vision 处理: [B, D] -> [B, H] -> Broadcast -> [B, G, H]
+            v_embed = self.vision_mlp(obs['vision_context'])
+            v_embed = v_embed.unsqueeze(1).expand(-1, self.num_groups, -1)
 
-        # C. Context 处理: [B, Total] cat [B, 1] -> [B, H] -> Broadcast -> [B, G, H]
-        ctx_data = torch.cat([obs['entropy'], obs['probs'], obs['time']], dim=-1)
-        c_embed = self.context_mlp(ctx_data)
-        c_embed = c_embed.unsqueeze(1).expand(-1, self.num_groups, -1)
+            # C. Context 处理: [B, Total] cat [B, 1] -> [B, H] -> Broadcast -> [B, G, H]
+            ctx_data = torch.cat([obs['entropy'], obs['probs'], obs['time']], dim=-1)
+            c_embed = self.context_mlp(ctx_data)
+            c_embed = c_embed.unsqueeze(1).expand(-1, self.num_groups, -1)
 
-        # D. Fusion
-        # cat dim=-1: [B, G, 3H]
-        combined = torch.cat([q_embed, v_embed, c_embed], dim=-1)
-        fused_feat = self.fusion_mlp(combined)  # [B, G, H]
+            # D. Fusion
+            # cat dim=-1: [B, G, 3H]
+            combined = torch.cat([q_embed, v_embed, c_embed], dim=-1)
+            fused_feat = self.fusion_mlp(combined)  # [B, G, H]
 
-        # Flatten for global tasks
-        flat_feat = fused_feat.reshape(B, -1)  # [B, G*H]
+            # Flatten for global tasks
+            flat_feat = fused_feat.reshape(B, -1)  # [B, G*H]
 
-        return fused_feat, flat_feat
+            return fused_feat, flat_feat
 
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, config, env_shapes, logger):
+    def __init__(self, config, env_shapes, logger = None):
         super().__init__()
         self.feature_extractor = MultiModalFeatureExtractor(config, env_shapes)
         hidden_dim = config.rl.hidden_dim
+
+        # [AMP Config]
+        self.use_amp = getattr(config.rl, 'use_amp', True)
+        self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         # --- Actor Heads ---
 
@@ -137,26 +149,37 @@ class ActorCriticNetwork(nn.Module):
         """
         一次性返回所有分布参数，供 Agent 采样使用
         """
-        # 提取特征
-        # group_feat: [B, G, H], flat_feat: [B, G*H]
-        group_feat, flat_feat = self.feature_extractor(obs)
+        # [AMP] 开启 Autocast
+        with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
+            # 提取特征
+            # group_feat: [B, G, H], flat_feat: [B, G*H]
+            group_feat, flat_feat = self.feature_extractor(obs)
 
-        # 1. Correction 分布参数
-        corr_mean = self.correction_mean(group_feat)  # [B, G, D]
-        # 注意: 这里 corr_mean 已经在 [-1, 1] 之间
-        # 真正的 scaling (e.g. * 0.1) 将在 Agent.get_action 中执行
+            # 1. Correction 分布参数
+            corr_mean = self.correction_mean(group_feat)  # [B, G, D]
+            # 注意: 这里 corr_mean 已经在 [-1, 1] 之间
+            # 真正的 scaling (e.g. * 0.1) 将在 Agent.get_action 中执行
 
-        corr_logstd = self.correction_logstd.expand_as(corr_mean)  # [B, G, D]
+            corr_logstd = self.correction_logstd.expand_as(corr_mean)  # [B, G, D]
 
-        # 2. Stop 分布参数
-        # --- 优化：拼接原始 Context 信息 ---
-        # explicit_signals: [B, Total*2]
-        explicit_signals = torch.cat([obs['entropy'], obs['probs']], dim=-1)
-        # stop_input: [B, G*H + Total*2]
-        stop_input = torch.cat([flat_feat, explicit_signals], dim=-1)
-        stop_logits = self.stop_head(stop_input)
+            # 2. Stop 分布参数
+            # --- 优化：拼接原始 Context 信息 ---
+            # explicit_signals: [B, Total*2]
+            explicit_signals = torch.cat([obs['entropy'], obs['probs']], dim=-1)
+            # stop_input: [B, G*H + Total*2]
+            stop_input = torch.cat([flat_feat, explicit_signals], dim=-1)
+            stop_logits = self.stop_head(stop_input)
 
-        # 3. State Value
-        value = self.value_head(flat_feat)  # [B, 1]
+            # 3. State Value
+            value = self.value_head(flat_feat)  # [B, 1]
 
-        return corr_mean, corr_logstd, stop_logits, value
+        # [CRITICAL] 强制转换为 Float32
+        # PPO 算法中计算 LogProb (Gaussian/Bernoulli) 和 Advantage (GAE) 
+        # 涉及 exp, log, pow 等操作，对精度极度敏感。必须转回 FP32。
+        
+        return (
+            corr_mean.float(), 
+            corr_logstd.float(), 
+            stop_logits.float(), 
+            value.float()
+        ) 

@@ -4,15 +4,16 @@ from collections import defaultdict
 
 
 class RolloutBuffer:
-    def __init__(self, config, device):
+    def __init__(self, config, device, logger=None):
         """
         PPO Rollout Buffer，支持 Dict Observation 和 Dict Action
         """
-        self.buffer_size = config.num_steps  # 每次更新前收集的步数
-        self.batch_size = config.batch_size  # PPO 更新时的 mini-batch 大小
-        self.gamma = config.gamma
-        self.gae_lambda = config.gae_lambda
+        # self.buffer_size = config.num_steps  # 每次更新前收集的步数
+        self.batch_size = config.rl.mini_batch  # PPO 更新时的 mini-batch 大小
+        self.gamma = config.rl.gamma
+        self.gae_lambda = config.rl.gae_lambda
         self.device = device
+        logger.info(f"Generalized Advantage Estimation, gamma: {self.gamma}, gae_lambda: {self.gae_lambda}")
 
         # 存储容器
         # 使用 List 存储每一步的数据，最后 stack 起来

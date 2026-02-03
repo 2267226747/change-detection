@@ -48,7 +48,7 @@ model:
   # Assembled Model
   assembled_model:
     num_layers: 18                # T_t 堆叠层数
-    start_classify: 1              # 开始挂载分类头的位置     start_classfy*2，因为只在reasoning层进行分类
+    start_classify: 1             # 开始挂载分类头的位置     start_classfy*2，因为只在reasoning层进行分类
 
   # 视觉编码器 (Vision Encoder)
   vision:
@@ -56,7 +56,7 @@ model:
     num_tokens: 7168             # vision token的总数量
     feature_dim: 1024            # InternViT vision token 原始输出维度
     freeze_backbone: Ture        # 是否冻结视觉部分参数
-    select_layer: -1           # [新增] 选择倒数第几层的输出 (官方建议 -4)
+    select_layer: -1             # 选择倒数第几层的输出 (官方建议 -4)
     vision_dim: 1024             # vision token经过unshuffle后的维度
 
   # query token
@@ -152,7 +152,44 @@ train:
 # 5. 强化学习 (RL - Step 2)
 # -------------------------
 rl:
+  # env
   pre_model_path: "./model/project/results/checkpoints/model_best.pth"
   device: "cuda"
-  freeze_classifier: "False"
-  hidden_dim: 512 # Env 返回的 Dict Obs 编码为统一的 Hidden State 的 dim
+  freeze_classifier: True
+
+  # networks
+  hidden_dim: 512          # Env 返回的 Dict Obs 编码为统一的 Hidden State 的 dim
+
+  # agent
+  clip_param: 0.2          # 每次更新时新策略（New Policy）相对于旧策略（Old Policy）的变化幅度。
+  use_value_clip: True     # 是否对 Critic（价值网络）的预测误差也进行截断
+  value_loss_coef: 0.5     # 总 Loss 中 Value Loss（MSE）的权重
+  entropy_coef: 0.01       # 熵正则化系数。熵（Entropy）代表策略的随机性
+  cls_loss_coef: 0.5
+  max_grad_norm: 0.5       # 梯度裁剪的最大范数
+  lr: 0.0001               # 学习率
+  weight_decay: 0.0001
+  action_scale: 0.1
+  layer_weights: [0.8, 0.85, 0.9, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0]
+  use_amp: True
+
+  # buffer
+  mini_batch: 6           # PPO 更新时的 mini-batch 大小
+  gamma: 0.95
+  gae_lambda: 0.96
+
+  # rewards
+  reward_neg_weight: 1.0
+  time_penalty: -0,2
+  use_reward_shaping: Ture
+  shaping_coef: 20
+  use_reward_scaling: True
+  save_dir: "./model/project/results/"
+
+  # trianner
+  batch_size: 12           # rollout 阶段的 batch 大小
+  total_epochs: 1000
+  ppo_epochs: 4            # PPO Epochs（同一个 Batch 数据更新多次）
+
+
+
