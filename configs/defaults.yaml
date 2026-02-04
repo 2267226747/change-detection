@@ -14,13 +14,13 @@ data:
   patches_num: 28              #所有子块的数量，包括缩略图   patches_h_num * patches_w_num + 1
   use_thumbnail: True
   vision_dim: 1024             # vision token经过unshuffle后的维度
-  num_workers: 16
+  num_workers: 8
 
   # 数据根目录 (根据你的实际路径修改)
   train_image_dir: "/root/autodl-tmp/data/SVI image(panorama)_Wuhan"
-  train_csv_path: "./model/project/Data/test_train_data.csv"
+  train_csv_path: "/root/autodl-tmp/model/project/Data/test_train_data.csv"
   val_image_dir: "/root/autodl-tmp/data/SVI image(panorama)_Wuhan"
-  val_csv_path: "./model/project/Data/test_val_data.csv"
+  val_csv_path: "/root/autodl-tmp/model/project/Data/test_val_data.csv"
   # CSV 中的关键列名
   col_oid: "OID_"
   col_name_t1: "name_15"
@@ -145,15 +145,15 @@ train:
   weight_decay: 0.0001
   epochs: 100
   device: "cuda"                  # "cuda" or "cpu"
-  save_dir: "./model/project/results/"
-  use_amp: True
+  save_dir: "/root/autodl-tmp/model/results/"
+  use_amp: False
 
 # -------------------------
 # 5. 强化学习 (RL - Step 2)
 # -------------------------
 rl:
   # env
-  pre_model_path: "./model/project/results/checkpoints/model_best.pth"
+  pre_model_path: "/root/autodl-tmp/model/results/checkpoints/premodel_best.pth"
   device: "cuda"
   freeze_classifier: True
 
@@ -164,27 +164,27 @@ rl:
   clip_param: 0.2          # 每次更新时新策略（New Policy）相对于旧策略（Old Policy）的变化幅度。
   use_value_clip: True     # 是否对 Critic（价值网络）的预测误差也进行截断
   value_loss_coef: 0.5     # 总 Loss 中 Value Loss（MSE）的权重
-  entropy_coef: 0.01       # 熵正则化系数。熵（Entropy）代表策略的随机性
+  entropy_coef: 0.00002       # 熵正则化系数。熵（Entropy）代表策略的随机性
   cls_loss_coef: 0.5
   max_grad_norm: 0.5       # 梯度裁剪的最大范数
-  lr: 0.0001               # 学习率
+  lr: 0.00005               # 学习率
   weight_decay: 0.0001
   action_scale: 0.1
   layer_weights: [0.8, 0.85, 0.9, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0]
-  use_amp: True
+  use_amp: False
 
   # buffer
-  mini_batch: 6           # PPO 更新时的 mini-batch 大小
+  mini_batch: 64          # PPO 更新时的 mini-batch 大小
   gamma: 0.95
   gae_lambda: 0.96
 
   # rewards
   reward_neg_weight: 1.0
-  time_penalty: -0,2
-  use_reward_shaping: Ture
+  time_penalty: -0.2
+  use_reward_shaping: True
   shaping_coef: 20
   use_reward_scaling: True
-  save_dir: "./model/project/results/"
+  save_dir: "/root/autodl-tmp/model/results"
 
   # trianner
   batch_size: 12           # rollout 阶段的 batch 大小

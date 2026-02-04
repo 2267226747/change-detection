@@ -160,7 +160,10 @@ class ActorCriticNetwork(nn.Module):
             # 注意: 这里 corr_mean 已经在 [-1, 1] 之间
             # 真正的 scaling (e.g. * 0.1) 将在 Agent.get_action 中执行
 
-            corr_logstd = self.correction_logstd.expand_as(corr_mean)  # [B, G, D]
+            # 限制 logstd 在合理区间，防止 exp() 爆炸
+            # -20 对应 std 极小，2 对应 std 约为 7.3
+            corr_logstd = torch.clamp(self.correction_logstd, -5, 0) 
+            corr_logstd = corr_logstd.expand_as(corr_mean)   # [B, G, D]
 
             # 2. Stop 分布参数
             # --- 优化：拼接原始 Context 信息 ---

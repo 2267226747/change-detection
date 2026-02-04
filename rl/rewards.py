@@ -62,7 +62,7 @@ class RewardCalculator:
 
             # 获取 pos_weight 列表
             # 注意:使用focal_alpha作为 RL 的 TP 奖励权重
-            weights = [((w-0.5) * self.tp_scale + 1) for w in group_cfg.focal_alpha]  # List[float]
+            weights = [((w - 0.5) * self.tp_scale + 1) for w in group_cfg.focal_alpha]  # List[float]
 
             if len(weights) != group_cfg.num_classes:
                 raise ValueError(
@@ -85,6 +85,7 @@ class RewardCalculator:
         在每个 episode 开始时重置状态。
         必须在 env.reset() 后调用此方法。
         """
+
         self.last_cls_loss = None
 
     def _calc_batch_metrics(self, preds, labels, probs, mask=None):
@@ -148,7 +149,7 @@ class RewardCalculator:
             'ap': ap
         }
 
-    def compute_reward(self, logits, labels, stop_decision, pre_action_mask, step, done_mask):
+    def compute_reward(self, logits, labels, stop_decision, pre_action_mask, done_mask):
         """
         计算单步奖励
 
@@ -164,8 +165,7 @@ class RewardCalculator:
         # 确保权重 Tensor 在正确的设备上
         if self.pos_weight_tensor.device != device:
             self.pos_weight_tensor = self.pos_weight_tensor.to(device)
-        if self.cls_criterion.device != device:
-            self.cls_criterion = self.cls_criterion.to(device)
+        self.cls_criterion = self.cls_criterion.to(device)
 
         # 1. 确定结算状态 (Settling)
         # 逻辑：原本是 Active (True) 且 Agent 喊停 (Stop=1)
@@ -201,7 +201,7 @@ class RewardCalculator:
         # 如果 Label=1 (FN风险): 惩罚 = -pos_weight (例如 -5)
         # 如果 Label=0 (FP风险): 惩罚 = -neg_weight (例如 -1)
         wrong_penalty = (-self.pos_weight_tensor * is_positive_label.float()) + (
-                    -self.neg_weight * (~is_positive_label).float())
+                -self.neg_weight * (~is_positive_label).float())
 
         # 3. 最终分类奖励矩阵
         # 如果预测正确 -> 取 success_rewards
@@ -225,7 +225,6 @@ class RewardCalculator:
         # ====================================================
         # C. [新增] 奖励整形 (Potential-Based Reward Shaping)
         # ====================================================
-        shaping_rewards = torch.zeros_like(logits)
         if self.use_reward_shaping:
             # 只在活跃的任务上计算 loss "潜力"
             # 注意：这里的 loss 是基于当前 logits，即 Agent 采取 action *之后* 的状态
@@ -234,12 +233,17 @@ class RewardCalculator:
             # 用 mask 将非活跃任务的 loss 清零
             masked_current_loss = current_loss * pre_action_mask.float()
             # 如果不是第一步
-            if self.last_cls_loss is not None:
-                # 潜力变化 = -(新Loss - 旧Loss) = 旧Loss - 新Loss
-                potential_diff = self.last_cls_loss - masked_current_loss
-                shaping_rewards = self.shaping_coef * potential_diff
+            if self.last_cls_loss is None:
+                with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
+                    org_logits = torch.zeros_like(logits)
+                    init_loss = self.cls_criterion(org_logits, labels.float()).float()
+                    self.last_cls_loss = (init_loss * pre_action_mask.float()).detach()
+            # 潜力变化 = -(新Loss - 旧Loss) = 旧Loss - 新Loss
+            potential_diff = self.last_cls_loss - masked_current_loss
+            shaping_rewards = self.shaping_coef * potential_diff
+
             # 更新状态，为下一步做准备
-            self.last_cls_loss = masked_current_loss.detach()  # detach很重要，防止梯度穿越episodes
+            self.last_cls_loss = (masked_current_loss * is_running.float()).detach()  # detach很重要，防止梯度穿越episodes
         else:
             # 只有在不使用 shaping 时才需要一个占位符
             # 如果后续汇总总是 .sum(dim=1)，甚至可以用一个标量0
@@ -291,4 +295,5 @@ class RewardCalculator:
             for k, v in finalall_metrics.items():
                 info[f'reward/finalall_{k}'] = v
 
-        return step_rewards.mean(), info
+        # 返回 [B] 形状的rewards供buffer使用
+        return step_rewards, info

@@ -23,9 +23,8 @@ class RLEnv:
         # 建议在 config 中添加该字段，默认 False
         self.use_amp = getattr(self.config.rl, 'use_amp', True)
         self.dtype = torch.float16 if self.use_amp else torch.float32
-        
         # 确定设备类型供 autocast 使用 ('cuda' or 'cpu')
-        self.device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
+        self.device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
         
         logger.info(f"RLEnv Mixed Precision (AMP) Enabled: {self.use_amp}")
 
@@ -315,7 +314,7 @@ class RLEnv:
         dones = all_stopped | max_reached
 
         info = {
-            'step': self.current_step,
+            'step': self.current_step - 1,
             'active_mask': self.subtask_active_mask,
             'pre_action_mask': pre_subtask_active_mask,  # 这是给 Reward 计算用的旧 mask
             'labels': self.current_labels,

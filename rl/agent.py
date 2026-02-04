@@ -20,6 +20,7 @@ class PPOAgent(nn.Module):
         self.network = network
         self.classifier_heads = classifier_heads
         self.rl_config = config.rl
+        self.device = self.rl_config.device
 
         # 参数初始化
         self.clip_param = getattr(self.rl_config, 'clip_param', 0.2)
@@ -28,6 +29,16 @@ class PPOAgent(nn.Module):
         self.entropy_coef = getattr(self.rl_config, 'entropy_coef', 0.01)
         self.cls_loss_coef = getattr(self.rl_config, 'cls_loss_coef', 0.5)
         self.max_grad_norm = getattr(self.rl_config, 'max_grad_norm', 0.5)
+        self.action_scale = getattr(self.rl_config, 'action_scale', 0.1)
+
+        logger.info(f"Clip param: {self.clip_param}, " 
+                    f"Value Clip: {self.use_value_clip}, "
+                    f"Value Loss Coef: {self.value_loss_coef}, "
+                    f"Entropy Coef: {self.entropy_coef}, "
+                    f"Cls Loss Coef: {self.cls_loss_coef}, "
+                    f"Max Grad Norm: {self.max_grad_norm}, "
+                    f"Action Scale: {self.action_scale}")
+
 
         # 获取是否冻结分类器的配置
         self.freeze_classifier = getattr(self.rl_config, 'freeze_classifier', False)
@@ -51,11 +62,10 @@ class PPOAgent(nn.Module):
             weight_decay=self.rl_config.weight_decay
         )
 
-        self.action_scale = self.rl_config.action_scale
-
         # [NEW] 初始化混合精度 Scaler
         # 注意：默认开启 enable=True，如果后续想关掉可以在这里控制
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.rl_config.use_amp)
+        self.use_amp  = getattr(self.rl_config, 'use_amp', False)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def get_action(self, obs, deterministic=False):
         """
@@ -67,6 +77,10 @@ class PPOAgent(nn.Module):
         # stop_logits: [B, Total]
         # value: [B, 1]
         corr_mean, corr_logstd, stop_logits, value = self.network(obs)
+        if torch.isnan(corr_mean).any():
+            print(f"Detected NaN in corr_mean: {corr_mean}")
+        if torch.isnan(corr_logstd).any():
+            print(f"Detected NaN in corr_logstd: {corr_logstd}")
 
         # 2. 构建分布
 
@@ -117,6 +131,10 @@ class PPOAgent(nn.Module):
         Args:
             raw_correction: 未缩放的 correction (直接来自 Normal 采样)
         """
+
+        for k, v in obs.items():
+            if torch.isnan(v).any():
+                print(f"Detected NaN in observation: {k}")
         # 1. 前向传播
         corr_mean, corr_logstd, stop_logits, value = self.network(obs)
 
@@ -159,7 +177,7 @@ class PPOAgent(nn.Module):
         # 注意: 这里的 'cuda' 应根据你的设备动态调整
         device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        with torch.amp.autocast(device_type=device_type):
+        with torch.amp.autocast(device_type=device_type, enabled=self.use_amp):
             # 1. 评估当前策略
             new_log_probs, entropy, values = self.evaluate_actions(
                 obs_batch, actions_corr_batch, actions_stop_batch
@@ -233,7 +251,7 @@ class PPOAgent(nn.Module):
 
                     # 提取对应的 Query (Query State 包含 t1 和 t2)
                     # obs['query_state']: [B, N, 2D]
-                    q_state_masked = obs_batch['query_state'][mask]
+                    q_state_masked = rollouts['cls_input_q'][mask]
                     D = q_state_masked.shape[-1] // 2
                     q_t1 = q_state_masked[:, :, :D]
                     q_t2 = q_state_masked[:, :, D:]

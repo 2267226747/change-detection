@@ -54,7 +54,7 @@ class VisionEncoder(nn.Module):
         # 在 cfg.model.hidden_dim 中定义，如果没有则默认 4096
         self.target_dim = getattr(cfg.model.vision, 'vision_dim', 4096)
         self.downsample_ratio = getattr(cfg.model.vision, 'downsample_ratio', 0.5)
-        logger.info(f"Downsample ratio{self.downsample_ratio}, Unshuffled vision dim{self.target_dim}")
+        logger.info(f"Downsample ratio: {self.downsample_ratio}, Unshuffled vision dim: {self.target_dim}")
 
         # 2. 计算 Scale 和 输入通道数
         # 情况 A (ratio=0.5): scale = 2, in_channels = output_dim * 4
@@ -107,7 +107,7 @@ class VisionEncoder(nn.Module):
             vit_embeds = self.pixel_unshuffle(vit_embeds)
 
         # 3. MLP Projector (包含 LayerNorm)
-        vit_embeds = self.mlp(vit_embeds)
+        vit_embeds = self.mlp(vit_embeds.float())
 
         return vit_embeds
 

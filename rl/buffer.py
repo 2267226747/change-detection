@@ -90,7 +90,7 @@ class RolloutBuffer:
                 next_non_terminal = 1.0 - done.float().to(self.device)
                 next_value = last_value.squeeze(-1)  # 确保维度匹配
             else:
-                next_non_terminal = 1.0 - dones[t + 1]
+                next_non_terminal = (~dones[t + 1]).float()
                 next_value = values[t + 1].squeeze(-1)
 
             # Delta = r + gamma * V(s') * mask - V(s)
@@ -165,7 +165,7 @@ class RolloutBuffer:
                 'values': flat_values[mb_indices],
                 'returns': flat_returns[mb_indices],
                 'advantages': flat_advantages[mb_indices],
-                'cls_query': flat_cls_query[mb_indices],
+                'cls_input_q': flat_cls_query[mb_indices],
                 'labels': flat_labels[mb_indices],
                 'step_indices': flat_step_indices[mb_indices]
             }

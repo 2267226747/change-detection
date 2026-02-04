@@ -58,7 +58,7 @@ class CheckpointManager:
 
         # 4. 如果是最佳模型，拷贝一份为 model_best.pth
         if is_best:
-            best_path = os.path.join(self.save_dir, 'checkpoints/model_best.pth')
+            best_path = os.path.join(self.save_dir, 'checkpoints/DL_model_best.pth')
             # 不再 copyfile，而是直接保存 model_state
             # 这样保存的文件不包含 optimizer, epoch 等信息，只有权重张量
             torch.save(model_state, best_path)

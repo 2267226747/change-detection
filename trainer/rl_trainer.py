@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 import os
 import time
 import pandas as pd
+from utils.logger import suppress_console_logging
 
 # 假设使用 tensorboard 记录
 from torch.utils.tensorboard import SummaryWriter
@@ -49,13 +50,20 @@ class PPOTrainer:
         self.window_metrics = defaultdict(lambda: deque(maxlen=20))  # 窗口大小可按需调整，例如 20 或 100
 
         self.history_data = []
-        self.csv_path = os.path.join(self.save_dir, '/acc_loss/RL_training_history.csv')
+        self.csv_path = os.path.join(self.save_dir, 'acc_loss/RL_training_history.csv')
+
+        # 获取混合精度配置
+        # 建议在 config 中添加该字段，默认 False
+        self.use_amp = getattr(self.rl_config, 'use_amp', True)
+        # self.dtype = torch.float16 if self.use_amp else torch.float32
+        # 确定设备类型供 autocast 使用 ('cuda' or 'cpu')
+        self.device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
 
         self.logger.info(f"Total epochs: {self.total_epochs}, "
-                        f"PPO epochs: {self.ppo_epochs}, "
-                        f"Eval interval: {self.eval_interval}, "
-                        f"Rollout batch size: {self.rl_config.batch_size}, "
-                        f"Update batch size: {buffer.batch_size}")
+                         f"PPO epochs: {self.ppo_epochs}, "
+                         f"Eval interval: {self.eval_interval}, "
+                         f"Rollout batch size: {self.rl_config.batch_size}, "
+                         f"Update batch size: {buffer.batch_size}")
 
     def _get_batch_data(self):
         """从 DataLoader 获取下一个 Batch，如果耗尽则重置"""
@@ -92,7 +100,10 @@ class PPOTrainer:
         current_rollout_stats = {}
 
         for step in range(self.env.max_steps):
-            with torch.no_grad():
+            for k, v in obs.items():
+                if torch.isnan(v).any():
+                    print(f"Detected NaN in observation: {k}, step {step}")
+            with torch.no_grad(), torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
                 # 1. Agent 决策
                 # return: dict_action, raw_corr, stop, log_prob, value
                 action, raw_corr, stop, log_prob, value = self.agent.get_action(obs)
@@ -107,7 +118,6 @@ class PPOTrainer:
                     labels=batch_labels,
                     stop_decision=stop,
                     pre_action_mask=info['pre_action_mask'],  # [Key] 使用旧 Mask
-                    step=info['step'],
                     done_mask=dones
                 )
 
@@ -141,6 +151,8 @@ class PPOTrainer:
             # 或者让 Env 内部处理 Dummy Step (通常 VectorEnv 会自动 Reset，但这里是单 Batch Env)
             # 鉴于我们的 Env 是处理固定步数 (max_steps)，这里循环通常会跑满 config.num_steps
             # 除非 max_steps < config.num_steps，这里假设 config.num_steps == env.max_steps
+            torch.cuda.empty_cache()
+
             if dones.all():
                 break
 
@@ -148,6 +160,11 @@ class PPOTrainer:
         # 需要最后一个状态的 Value 来做 Bootstrap
         with torch.no_grad():
             _, _, _, last_value = self.agent.network(next_obs)  # 只取 Value
+
+        # ==========================================
+        # 显式调用 Buffer 计算 Advantage
+        # ==========================================
+        self.buffer.compute_returns_and_advantage(last_value, dones)
 
         # --- 记录统计指标 ---
         # 1. Reward
@@ -193,16 +210,18 @@ class PPOTrainer:
         global_step = 0
         best_F1 = 0.0
 
-        for epoch in tqdm(range(self.total_epochs), desc="Training"):
+        pbar = tqdm(range(self.total_epochs), desc="Training", leave=False)
+
+        for _,epoch in enumerate(pbar):
             torch.cuda.empty_cache()  # 释放未使用的 cached memory
             epoch_log = {'epoch': epoch}
             # 1. 收集数据
-            print('rollout phase')
+            # print('rollout phase')
             rollout_metrics = self.collect_rollouts()
-            print('rollout phase done')
-            print('update phase')
+            # print('rollout phase done')
+            # print('update phase')
             epoch_log.update(rollout_metrics)
-            print('update phase done')
+            # print('update phase done')
 
             # 2. 更新模型
             train_loss_metrics = self.update()
@@ -237,7 +256,11 @@ class PPOTrainer:
                 log_msg_parts.append(f"{k}: {mean_val:.4f}")
 
             # 统一打印
-            self.logger.info(' | '.join(log_msg_parts))
+            pbar.set_postfix_str(' | '.join(log_msg_parts))
+            # 👇 这段日志只写文件，不打印到控制台
+            with suppress_console_logging(self.logger):
+                self.logger.info(' | '.join(log_msg_parts))
+
 
             # 4. 验证集评估
             if (epoch + 1) % self.eval_interval == 0 and self.val_loader:
@@ -253,7 +276,7 @@ class PPOTrainer:
             df.to_csv(self.csv_path, index=False)
 
     def save_checkpoint(self, epoch, is_best=False):
-        path = os.path.join(self.save_dir, f"/checkpoints/RL_last.pt")
+        path = os.path.join(self.save_dir, f"checkpoints/RL_last.pt")
         torch.save({
             'epoch': epoch,
             'agent_state_dict': self.agent.state_dict(),
@@ -265,7 +288,7 @@ class PPOTrainer:
         }, path)
         self.logger.info(f"Saved checkpoint to {path}")
         if is_best:
-            path = os.path.join(self.save_dir, f"/checkpoints/RL_best.pt")
+            path = os.path.join(self.save_dir, f"checkpoints/RL_best.pt")
             torch.save({
                 # 'epoch': epoch,
                 'agent_state_dict': self.agent.state_dict(),
@@ -296,79 +319,82 @@ class PPOTrainer:
             # 使用 tqdm 显示进度
             pbar = tqdm(self.val_loader, desc=f"Eval Ep{epoch}", leave=False)
             for batch_data in pbar:
-                # 数据准备
-                # 假设 batch_data['labels'] 是 [B, Total]
-                batch_labels = batch_data['labels'].to(self.device)
+                with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp):
+                    # 数据准备
+                    # 假设 batch_data['labels'] 是 [B, Total]
+                    batch_labels = batch_data['labels'].to(self.device)
 
-                # Reset Env
-                obs = self.env.reset(batch_data)
+                    # Reset Env
+                    obs = self.env.reset(batch_data)
+                    # 在每个 episode 开始时重置状态。
+                    self.reward_calc.reset()
 
-                # 统计容器
-                batch_rewards = torch.zeros(self.env.batch_size, device=self.device)
-                steps_taken = torch.zeros(self.env.batch_size, device=self.device)  # 记录每个样本跑了多少步
-                active_mask = torch.ones(self.env.batch_size, dtype=torch.bool, device=self.device)  # 记录样本是否还在跑
+                    # 统计容器
+                    batch_rewards = torch.zeros(self.env.batch_size,device=self.device)
+                    steps_taken = torch.zeros(self.env.batch_size, device=self.device)  # 记录每个样本跑了多少步
+                    active_mask = torch.ones(self.env.batch_size, dtype=torch.bool, device=self.device)  # 记录样本是否还在跑
 
-                # Rollout loop
-                for step in range(self.env.max_steps):
-                    # Agent 决策
-                    action, _, stop, _, _ = self.agent.get_action(obs, deterministic=True)
+                    # Rollout loop
+                    for step in range(self.env.max_steps):
+                        # Agent 决策
+                        action, _, stop, _, _ = self.agent.get_action(obs, deterministic=True)
 
-                    # Env 执行
-                    next_obs, _, dones, info = self.env.step(action)
+                        # Env 执行
+                        next_obs, _, dones, info = self.env.step(action)
 
-                    # 3. 记录步数 (只要还没 done，步数就+1)
-                    # 注意：dones 是 [B]，表示该样本所有任务是否都结束
-                    # 如果样本还在跑 (active)，这一步算作有效消耗
-                    steps_taken[active_mask] += 1
-                    active_mask = ~dones  # 更新活跃状态
+                        # 3. 记录步数 (只要还没 done，步数就+1)
+                        # 注意：dones 是 [B]，表示该样本所有任务是否都结束
+                        # 如果样本还在跑 (active)，这一步算作有效消耗
+                        steps_taken[active_mask] += 1
+                        active_mask = ~dones  # 更新活跃状态
 
-                    # 4. 计算 Reward (仅作记录)
-                    # 注意：这里我们信任 RewardCalculator 的逻辑，但 Accuracy 我们自己算更准
-                    # 计算 Reward (用于统计指标)
-                    rewards, r_info = self.reward_calc.compute_reward(
-                        logits=self.env.final_logits.detach(),
-                        labels=batch_labels,
-                        stop_decision=stop,
-                        pre_action_mask=info['pre_action_mask'],
-                        done_mask=dones
-                    )
+                        # 4. 计算 Reward (仅作记录)
+                        # 注意：这里我们信任 RewardCalculator 的逻辑，但 Accuracy 我们自己算更准
+                        # 计算 Reward (用于统计指标)
+                        rewards, r_info = self.reward_calc.compute_reward(
+                            logits=self.env.final_logits.detach(),
+                            labels=batch_labels,
+                            stop_decision=stop,
+                            pre_action_mask=info['pre_action_mask'],
+                            done_mask=dones
+                        )
 
-                    batch_rewards += rewards
-                    obs = next_obs
+                        batch_rewards += rewards
+                        obs = next_obs
 
-                    # 5. [优化] 提前退出：如果所有样本都结束了，不需要空跑
-                    if dones.all():
-                        break
+                        # 5. [优化] 提前退出：如果所有样本都结束了，不需要空跑
+                        if dones.all():
+                            break
 
-                # --- Batch 结算 ---
+                    # --- Batch 结算 ---
 
-                # 1. 记录基础指标
-                val_metrics['reward'].append(batch_rewards.mean().item())
-                val_metrics['avg_steps'].append(steps_taken.mean().item())
+                    # 1. 记录基础指标
+                    val_metrics['reward'].append(batch_rewards.mean().item())
+                    val_metrics['avg_steps'].append(steps_taken.mean().item())
 
-                # 2. 从 final_step_info 中提取高阶指标 (Acc, F1, Rec...)
-                # 假设 r_info key 格式为 "reward/settled_acc" 或 "settled_acc"
-                current_acc = 0.0  # 用于进度条显示
-                current_f1 = 0.0
+                    # 2. 从 final_step_info 中提取高阶指标 (Acc, F1, Rec...)
+                    # 假设 r_info key 格式为 "reward/settled_acc" 或 "settled_acc"
+                    current_acc = 0.0  # 用于进度条显示
+                    current_f1 = 0.0
 
-                for k, v in r_info.items():
-                    # 过滤掉不需要记录的中间变量，只保留 settled 指标
-                    if 'finalall_' in k:
-                        # 清洗 key 名称: 'reward/finalall_acc' -> 'acc'
-                        metric_name = k.split('finalall_')[-1]
-                        val_metrics[f'val/{metric_name}'].append(v)
+                    for k, v in r_info.items():
+                        # 过滤掉不需要记录的中间变量，只保留 settled 指标
+                        if 'finalall_' in k:
+                            # 清洗 key 名称: 'reward/finalall_acc' -> 'acc'
+                            metric_name = k.split('finalall_')[-1]
+                            val_metrics[f'val/{metric_name}'].append(v)
 
-                        # 顺便获取 acc 用于显示
-                        if 'acc' in metric_name:
-                            current_acc = v
-                        if 'f1' in metric_name:
-                            current_f1 = v
-                # 更新进度条
-                pbar.set_postfix({
-                    'acc': f"{current_acc:.3f}",
-                    'f1': f"{current_f1:.3f}",
-                    'rew': f"{batch_rewards.mean().item():.2f}"
-                })
+                            # 顺便获取 acc 用于显示
+                            if 'acc' in metric_name:
+                                current_acc = v
+                            if 'f1' in metric_name:
+                                current_f1 = v
+                    # 更新进度条
+                    pbar.set_postfix({
+                        'acc': f"{current_acc:.3f}",
+                        'f1': f"{current_f1:.3f}",
+                        'rew': f"{batch_rewards.mean().item():.2f}"
+                    })
 
             # --- 汇总与日志 ---
 

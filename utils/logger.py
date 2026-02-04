@@ -3,6 +3,31 @@ import os
 import sys
 from datetime import datetime
 
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_console_logging(logger):
+    """
+    临时移除 logger 中的所有 StreamHandler（控制台输出），退出后恢复。
+    适用于：仅将日志写入文件，不打印到终端。
+    """
+    # 找出所有 StreamHandler（排除 FileHandler）
+    stream_handlers = [
+        h for h in logger.handlers
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+    ]
+    
+    # 临时移除
+    for h in stream_handlers:
+        logger.removeHandler(h)
+    
+    try:
+        yield logger
+    finally:
+        # 恢复
+        for h in stream_handlers:
+            logger.addHandler(h)
+
 
 def setup_logger(save_dir, distributed_rank=0, filename="log/train.log", name="SVI_Project"):
     """
